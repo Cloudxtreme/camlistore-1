@@ -31,6 +31,7 @@ Example low-level config:
 package diskpacked
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -54,11 +55,11 @@ type storage struct {
 	root        string
 	index       index.Storage
 	indexCloser io.Closer
-	maxFileSize int64
+	maxFileSize uint64
 
 	mu       sync.Mutex
 	current  *os.File
-	currentN int64
+	currentN uint64
 	closed   bool
 }
 
@@ -95,12 +96,14 @@ func init() {
 
 // openCurrent makes sure the current data file is open as s.current.
 func (s *storage) openCurrent() error {
+	var size int64
+	var err error
 	if s.current == nil {
 		// First run; find the latest file data file and open it
 		// and seek to the end.
 		// If no data files exist, leave s.current as nil.
 		for {
-			_, err := os.Stat(s.filename(s.currentN))
+			_, err = os.Stat(s.filename(s.currentN))
 			if os.IsNotExist(err) {
 				break
 			}
@@ -115,21 +118,22 @@ func (s *storage) openCurrent() error {
 			if err != nil {
 				return err
 			}
-			if _, err = f.Seek(0, 2); err != nil {
+			if size, err = f.Seek(0, 2); err != nil {
 				return err
 			}
-			s.current = f
+			if uint64(size) > s.maxFileSize { // too big, don't use
+				f.Close()
+			} else {
+				s.current = f
+			}
 		}
-	}
-
-	// If s.current is open, check its size and if it's too big close it,
-	// and advance currentN.
-	if s.current != nil {
-		fi, err := s.current.Stat()
-		if err != nil {
+	} else {
+		// If s.current is open, check its size and if it's too big close it,
+		// and advance currentN.
+		if size, err = s.current.Seek(0, 1); err != nil {
 			return err
 		}
-		if fi.Size() > s.maxFileSize {
+		if uint64(size) > s.maxFileSize {
 			f := s.current
 			s.current = nil
 			s.currentN++
@@ -177,7 +181,8 @@ func (s *storage) Fetch(br blob.Ref) (types.ReadSeekCloser, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	return openFile{io.NewSectionReader(f, meta.offset, meta.size), f}, meta.size, nil
+	return openFile{io.NewSectionReader(f, int64(meta.offset), int64(meta.size)),
+		f}, int64(meta.size), nil
 }
 
 type openFile struct {
@@ -185,8 +190,8 @@ type openFile struct {
 	io.Closer
 }
 
-func (s *storage) filename(file int64) string {
-	return filepath.Join(s.root, fmt.Sprintf("data-%v", file))
+func (s *storage) filename(file uint64) string {
+	return filepath.Join(s.root, fmt.Sprintf("data-%020d", file))
 }
 
 func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
@@ -254,10 +259,6 @@ func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (brGot blob.SizedRe
 		err = fmt.Errorf("temp file %q size %d didn't match written size %d", tempFile.Name(), stat.Size(), written)
 		return
 	}
-	if !br.HashMatches(hash) {
-		err = blobserver.ErrCorruptBlob
-		return
-	}
 
 	if _, err = tempFile.Seek(0, 0); err != nil {
 		return
@@ -294,7 +295,7 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	if err = s.current.Sync(); err != nil {
 		return err
 	}
-	return s.index.Set(br.Ref.String(), blobMeta{s.currentN, offset, br.Size}.String())
+	return s.index.Set(br.Ref.String(), blobMeta{s.currentN, uint64(offset), uint64(br.Size)}.String())
 }
 
 // meta fetches the metadata for the specified blob from the index.
@@ -315,18 +316,28 @@ func (s *storage) meta(br blob.Ref) (m blobMeta, err error) {
 
 // blobMeta is the blob metadata stored in the index.
 type blobMeta struct {
-	file, offset, size int64
+	file, offset, size uint64
 }
 
 func parseBlobMeta(s string) (m blobMeta, ok bool) {
-	n, err := fmt.Sscan(s, &m.file, &m.offset, &m.size)
-	return m, n == 3 && err == nil
+	if len(s) != 3*8 {
+		return m, false
+	}
+	buf := []byte(s)
+	binary.LittleEndian.Uint64(buf[:8])
+	binary.LittleEndian.Uint64(buf[8:16])
+	binary.LittleEndian.Uint64(buf[16:24])
+	return m, true
 }
 
 func (m blobMeta) String() string {
-	return fmt.Sprintf("%v %v %v", m.file, m.offset, m.size)
+	buf := make([]byte, 8*3)
+	binary.LittleEndian.PutUint64(buf[:8], m.file)
+	binary.LittleEndian.PutUint64(buf[8:16], m.offset)
+	binary.LittleEndian.PutUint64(buf[16:24], m.size)
+	return string(buf)
 }
 
 func (m blobMeta) SizedRef(br blob.Ref) blob.SizedRef {
-	return blob.SizedRef{Ref: br, Size: m.size}
+	return blob.SizedRef{Ref: br, Size: int64(m.size)}
 }
