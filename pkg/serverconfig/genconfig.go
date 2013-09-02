@@ -382,6 +382,53 @@ func addGoogleCloudStorageConfig(prefixes jsonconfig.Obj, highCfg string) error 
 	return nil
 }
 
+func addWeedFSConfig(prefixes jsonconfig.Obj, weedfs string) error {
+	f := strings.SplitN(weedfs, ":", 2)
+	if len(f) != 2 {
+		return errors.New(`genconfig: expected "weedfs" field to be of form "dbDir:masterURL"`)
+	}
+	dbDir, masterURL := f[0], f[1]
+
+	isPrimary := false
+	if _, ok := prefixes["/bs/"]; !ok {
+		isPrimary = true
+	}
+	weedfsPrefix := ""
+	if isPrimary {
+		weedfsPrefix = "/bs/"
+	} else {
+		weedfsPrefix = "/sto-weedfs/"
+	}
+	prefixes[weedfsPrefix] = map[string]interface{}{
+		"handler": "storage-weedfs",
+		"handlerArgs": map[string]interface{}{
+			"dbDir":     dbDir,
+			"masterURL": masterURL,
+		},
+	}
+	if isPrimary {
+		prefixes["/cache/"] = map[string]interface{}{
+			"handler": "storage-filesystem",
+			"handlerArgs": map[string]interface{}{
+				"path": filepath.Join(tempDir(), "camli-cache"),
+			},
+		}
+	} else {
+		prefixes["/sync-to-weedfs/"] = map[string]interface{}{
+			"handler": "sync",
+			"handlerArgs": map[string]interface{}{
+				"from": "/bs/",
+				"to":   weedfsPrefix,
+				"queue": map[string]interface{}{
+					"type": "kv",
+					"file": filepath.Join(dbDir, "sync-to-weedfs-queue.kv"),
+				},
+			},
+		}
+	}
+	return nil
+}
+
 func genLowLevelPrefixes(params *configPrefixesParams, ownerName string) (m jsonconfig.Obj) {
 	m = make(jsonconfig.Obj)
 
@@ -508,14 +555,14 @@ func genLowLevelPrefixes(params *configPrefixesParams, ownerName string) (m json
 		}
 
 		searchArgs := map[string]interface{}{
-				"index": params.indexerPath,
-				"owner": params.searchOwner.String(),
+			"index": params.indexerPath,
+			"owner": params.searchOwner.String(),
 		}
 		if params.memoryIndex {
 			searchArgs["slurpToMemory"] = true
 		}
 		m["/my-search/"] = map[string]interface{}{
-			"handler": "search",
+			"handler":     "search",
 			"handlerArgs": searchArgs,
 		}
 	}
@@ -539,6 +586,7 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 		blobPath           = conf.OptionalString("blobPath", "")
 		packBlobs          = conf.OptionalBool("packBlobs", false)         // use diskpacked instead of the default filestorage
 		s3                 = conf.OptionalString("s3", "")                 // "access_key_id:secret_access_key:bucket[:hostname]"
+		weedfs             = conf.OptionalString("weedfs", "")             // "dbDir:masterURL"
 		googlecloudstorage = conf.OptionalString("googlecloudstorage", "") // "clientId:clientSecret:refreshToken:bucket"
 		googledrive        = conf.OptionalString("googledrive", "")        // "clientId:clientSecret:refreshToken:parentId"
 		// Enable the share handler. If true, and shareHandlerPath is empty,
@@ -650,8 +698,8 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 
 	nolocaldisk := blobPath == ""
 	if nolocaldisk {
-		if s3 == "" && googlecloudstorage == "" {
-			return nil, errors.New("You need at least one of blobPath (for localdisk) or s3 or googlecloudstorage configured for a blobserver.")
+		if s3 == "" && googlecloudstorage == "" && weedfs == "" {
+			return nil, errors.New("You need at least one of blobPath (for localdisk) or s3 or googlecloudstorage or weedfs configured for a blobserver.")
 		}
 		if s3 != "" && googlecloudstorage != "" {
 			return nil, errors.New("Using S3 as a primary storage and Google Cloud Storage as a mirror is not supported for now.")
@@ -733,6 +781,11 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 	}
 	if googlecloudstorage != "" {
 		if err := addGoogleCloudStorageConfig(prefixes, googlecloudstorage); err != nil {
+			return nil, err
+		}
+	}
+	if weedfs != "" {
+		if err := addWeedFSConfig(prefixes, weedfs); err != nil {
 			return nil, err
 		}
 	}

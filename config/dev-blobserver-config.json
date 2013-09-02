@@ -12,6 +12,13 @@
          "handlerArgs": {
             "path": ["_env", "${CAMLI_ROOT}"]
       }
+    },
+    "/weedfs/": {
+        "handler": "weedfs",
+        "handlerArgs": {
+            "masterURL": "localhost:9333",
+            "dbDir": ["_env", "${CAMLI_ROOT}"]
+        }
     }
   }
 }

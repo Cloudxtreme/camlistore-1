@@ -59,6 +59,8 @@ import (
 	_ "camlistore.org/pkg/blobserver/replica"
 	_ "camlistore.org/pkg/blobserver/s3"
 	_ "camlistore.org/pkg/blobserver/shard"
+	_ "camlistore.org/pkg/blobserver/weedfs"
+
 	// Indexers: (also present themselves as storage targets)
 	_ "camlistore.org/pkg/index" // base indexer + in-memory dev index
 	_ "camlistore.org/pkg/index/kvfile"
