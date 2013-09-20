@@ -31,10 +31,10 @@ Example low-level config:
 package diskpacked
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -57,6 +57,8 @@ type storage struct {
 	root        string
 	index       sorted.KeyValue
 	maxFileSize int64
+
+	mirrorPartitions []*localdisk.DiskStorage // for implementing queues
 
 	mu       sync.Mutex
 	current  *os.File
@@ -144,7 +146,7 @@ func (s *storage) openCurrent() error {
 			if err != nil {
 				return err
 			}
-			f, err := os.OpenFile(s.filename(s.currentN), os.O_RDWR, 0666)
+			f, err := openFile(s.filename(s.currentN), true)
 			if err != nil {
 				l.Close()
 				return err
@@ -216,6 +218,14 @@ func (s *storage) FetchStreaming(br blob.Ref) (io.ReadCloser, int64, error) {
 	return s.Fetch(br)
 }
 
+func openFile(filename string, writable bool) (*os.File, error) {
+	// TODO(adg): pool open file descriptors
+	if writable {
+		return os.OpenFile(filename, os.O_RDWR, 0666)
+	}
+	return os.Open(filename)
+}
+
 func (s *storage) Fetch(br blob.Ref) (types.ReadSeekCloser, int64, error) {
 	meta, err := s.meta(br)
 	if err != nil {
@@ -236,9 +246,18 @@ func (s *storage) filename(file int64) string {
 	return filepath.Join(s.root, fmt.Sprintf("pack-%05d.blobs", file))
 }
 
+// RemoveBlobs removes the blobs from index and pads data with zero bytes
 func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
-	// TODO(adg): remove blob from index and pad data with spaces
-	return errors.New("diskpacked: RemoveBlobs not implemented")
+	batch := s.index.BeginBatch()
+	var err error
+	for _, br := range blobs {
+		if err = s.delete(br); err != nil {
+			return err
+		}
+		log.Printf("Deleting %s", br)
+		batch.Delete(br.String())
+	}
+	return s.index.CommitBatch(batch)
 }
 
 var statGate = syncutil.NewGate(20) // arbitrary
@@ -289,55 +308,116 @@ func (s *storage) EnumerateBlobs(dest chan<- blob.SizedRef, after string, limit 
 }
 
 func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sbr blob.SizedRef, err error) {
-	// TODO(adg): write to temp file if blob exceeds some size (generalize code from s3)
-	var b bytes.Buffer
-	n, err := b.ReadFrom(source)
+	b, err := makeRestartable(br, source, len(s.mirrorPartitions) > 0)
 	if err != nil {
 		return
 	}
-	sbr = blob.SizedRef{Ref: br, Size: n}
-	err = s.append(sbr, &b)
+	sbr = blob.SizedRef{Ref: br, Size: b.Size()}
+	err = s.append(sbr, b)
+	b.Close()
 	return
+}
+
+// prepareAppend prepares an append without locking
+// append = Lock() + prepareAppend + io.Copy(s.current, r) + finishAppend + Unlock()
+func (s *storage) prepareAppend(br blob.SizedRef) (err error) {
+	if s.closed {
+		return errors.New("diskpacked: write to closed storage")
+	}
+	if err = s.openCurrent(); err != nil {
+		return
+	}
+	n, err := fmt.Fprintf(s.current, "[%v %v]", br.Ref.String(), br.Size)
+	s.currentO += int64(n)
+	if err != nil {
+		return
+	}
+
+	// TODO(adg): remove this seek and the offset check once confident
+	offset, err := s.current.Seek(0, os.SEEK_CUR)
+	if err != nil {
+		return
+	}
+	if offset != s.currentO {
+		return fmt.Errorf("diskpacked: seek says offset = %d, we think %d", offset, s.currentO)
+	}
+	offset = s.currentO // make this a declaration once the above is removed
+	return nil
+}
+
+// finishAppend finishes an append and releases the lock
+// n is the written size (as returned by io.Copy)
+func (s *storage) finishAppend(br blob.SizedRef, n int64) (err error) {
+	offset := s.currentO
+	s.currentO += n
+	if n != br.Size {
+		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
+	}
+
+	if err = s.current.Sync(); err != nil {
+		return err
+	}
+	log.Printf("setting %s in %s", br, s.root)
+	err = s.index.Set(br.Ref.String(), blobMeta{s.currentN, offset, br.Size}.String())
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // append writes the provided blob to the current data file.
 func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return errors.New("diskpacked: write to closed storage")
-	}
-	if err := s.openCurrent(); err != nil {
-		return err
-	}
-	n, err := fmt.Fprintf(s.current, "[%v %v]", br.Ref.String(), br.Size)
-	s.currentO += int64(n)
+
+	err := s.prepareAppend(br)
 	if err != nil {
 		return err
 	}
 
-	// TODO(adg): remove this seek and the offset check once confident
-	offset, err := s.current.Seek(0, os.SEEK_CUR)
+	rs, err := makeRestartable(br.Ref, r, true)
 	if err != nil {
 		return err
 	}
-	if offset != s.currentO {
-		return fmt.Errorf("diskpacked: seek says offset = %d, we think %d", offset, s.currentO)
-	}
-	offset = s.currentO // make this a declaration once the above is removed
-
-	n2, err := io.Copy(s.current, r)
-	s.currentO += n2
+	defer rs.Close()
+	n2, err := io.Copy(s.current, rs)
 	if err != nil {
 		return err
 	}
 	if n2 != br.Size {
-		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
+		return fmt.Errorf("size mismatch in append: wanted %d, got %d", br.Size, n2)
 	}
-	if err = s.current.Sync(); err != nil {
+
+	if err = s.finishAppend(br, n2); err != nil {
 		return err
 	}
-	return s.index.Set(br.Ref.String(), blobMeta{s.currentN, offset, br.Size}.String())
+
+	if len(s.mirrorPartitions) == 0 {
+		return nil
+	}
+
+	var merr error
+	var sb blob.SizedRef
+	for _, mirror := range s.mirrorPartitions {
+		if mirror == nil {
+			continue
+		}
+		if err = rs.Restart(); err != nil {
+			merr = err
+			break
+		}
+		if sb, err = mirror.ReceiveBlob(br.Ref, rs); err != nil {
+			merr = err
+			continue
+		}
+		if sb.Size != br.Size {
+			merr = fmt.Errorf("size mismatch in replication: wanted %d, got %d", br.Size, sb.Size)
+		} else if sb.Ref != br.Ref {
+			merr = fmt.Errorf("ref mismatch in replication: wanted %q, got %q", br.Ref, sb.Ref)
+		}
+	}
+
+	return merr
 }
 
 // meta fetches the metadata for the specified blob from the index.
