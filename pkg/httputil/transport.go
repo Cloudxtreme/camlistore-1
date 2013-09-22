@@ -22,6 +22,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"camlistore.org/pkg/tef"
 )
 
 // StatsTransport wraps another RoundTripper (or uses the default one) and
@@ -36,6 +38,9 @@ type StatsTransport struct {
 
 	// If VerboseLog is true, HTTP request summaries are logged.
 	VerboseLog bool
+
+	// If create Stats is true, HTTP roundtrip times are logged.
+	Stats chan<- []tef.Taskstats
 }
 
 func (t *StatsTransport) Requests() int {
@@ -55,19 +60,32 @@ func (t *StatsTransport) RoundTrip(req *http.Request) (resp *http.Response, err 
 		rt = http.DefaultTransport
 	}
 	var t0 time.Time
-	if t.VerboseLog {
+	if t.VerboseLog || t.Stats != nil {
 		t0 = time.Now()
-		log.Printf("(%d) %s %s ...", n, req.Method, req.URL)
+		if t.VerboseLog {
+			log.Printf("(%d) %s %s ...", n, req.Method, req.URL)
+		}
 	}
 	resp, err = rt.RoundTrip(req)
-	if t.VerboseLog {
+	if t.VerboseLog || t.Stats != nil {
 		t1 := time.Now()
 		td := t1.Sub(t1)
-		if err == nil {
-			log.Printf("(%d) %s %s = status %d (in %v)", n, req.Method, req.URL, resp.StatusCode, td)
-			resp.Body = &logBody{body: resp.Body, n: n, t0: t0, t1: t1}
-		} else {
-			log.Printf("(%d) %s %s = error: %v (in %v)", n, req.Method, req.URL, err, td)
+		if t.VerboseLog {
+			if err == nil {
+				log.Printf("(%d) %s %s = status %d (in %v)", n, req.Method, req.URL, resp.StatusCode, td)
+				resp.Body = &logBody{body: resp.Body, n: n, t0: t0, t1: t1}
+			} else {
+				log.Printf("(%d) %s %s = error: %v (in %v)", n, req.Method, req.URL, err, td)
+			}
+		}
+		if t.Stats != nil {
+            select {
+            case t.Stats <- []tef.Taskstats{
+				tef.Taskstats{Pid: uint32(t.reqs), Ppid: 1,
+					Command:         req.Method + " " + req.URL.String(),
+                    BlkioDelayTotal: uint64(td)}}:
+                default:
+                }
 		}
 	}
 	return

@@ -41,6 +41,7 @@ var (
 	flagHTTP       = flag.Bool("verbose_http", false, "show HTTP request summaries")
 	flagHaveCache  = true
 	flagBlobDir    = flag.String("blobdir", "", "If non-empty, the local directory to put blobs, instead of sending them over the network. If the string \"discard\", no blobs are written or sent over the network anywhere.")
+	flagTrace      = flag.String("trace", "", "dump trace into the given json.gz file")
 )
 
 var (

@@ -36,6 +36,7 @@ import (
 	"camlistore.org/pkg/legal/legalprint"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/schema"
+	"camlistore.org/pkg/tef"
 	"camlistore.org/pkg/types"
 )
 
@@ -51,6 +52,7 @@ var (
 	flagTrustedCert   = flag.String("cert", "", "If non-empty, the fingerprint (20 digits lowercase prefix of the SHA256 of the complete certificate) of the TLS certificate we trust for the share URL. Requires --shared.")
 	flagInsecureTLS   = flag.Bool("insecure", false, "If set, when using TLS, the server's certificates verification is disabled, and they are not checked against the trustedCerts in the client configuration either.")
 	flagSkipIrregular = flag.Bool("skip_irregular", false, "If true, symlinks, device files, and other special file types are skipped.")
+	flagTrace         = flag.String("trace", "", "json.gz file name of the trace data to make")
 )
 
 func main() {
@@ -108,6 +110,14 @@ func main() {
 		Verbose: *flagHTTP,
 	})
 	httpStats, _ := tr.(*httputil.StatsTransport)
+	if *flagTrace != "" {
+		ch, closer, err := tef.SetupCmdWriter(*flagTrace)
+		if err != nil {
+			log.Fatalf("Error setting up tracing: %v", err)
+		}
+		defer closer()
+		httpStats.Stats = ch
+	}
 	cl.SetHTTPClient(&http.Client{Transport: tr})
 
 	diskCacheFetcher, err := cacher.NewDiskCache(cl)
