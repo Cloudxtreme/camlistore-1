@@ -42,6 +42,7 @@ type configPrefixesParams struct {
 	keyId            string
 	indexerPath      string
 	blobPath         string
+	diskPack         string
 	searchOwner      blob.Ref
 	shareHandlerPath string
 }
@@ -428,32 +429,59 @@ func genLowLevelPrefixes(params *configPrefixesParams, ownerName string) (m json
 		},
 	}
 
-	if params.blobPath != "" {
-		m["/bs/"] = map[string]interface{}{
-			"handler": "storage-filesystem",
-			"handlerArgs": map[string]interface{}{
-				"path": params.blobPath,
-			},
+	lDir := params.blobPath
+	if params.blobPath != "" || params.diskPack != "" {
+		if params.blobPath != "" {
+			m["/bs/"] = map[string]interface{}{
+				"handler": "storage-filesystem",
+				"handlerArgs": map[string]interface{}{
+					"path": params.blobPath,
+				},
+			}
+		} else {
+			m["/bs/"] = map[string]interface{}{
+				"handler": "storage-diskpacked",
+				"handlerArgs": map[string]interface{}{
+					"path": params.diskPack,
+				},
+			}
+			lDir = params.diskPack
 		}
 
 		m["/cache/"] = map[string]interface{}{
 			"handler": "storage-filesystem",
 			"handlerArgs": map[string]interface{}{
-				"path": filepath.Join(params.blobPath, "/cache"),
+				"path": filepath.Join(lDir, "/cache"),
 			},
 		}
 	}
 
 	if haveIndex {
+		// TODO(tgulacsi): shall we check whether /bs/ implements CreateQueue?
+		//  If yes, than how?
+		replBackends := []interface{}{"/bs/", params.indexerPath}
+		syncFrom := "/bs/"
+		if params.diskPack != "" {
+			syncFrom = "/sync-queue/"
+			m[syncFrom] = map[string]interface{}{
+				"handler": "storage-filesystem",
+				"handlerArgs": map[string]interface{}{
+					"path": filepath.Join(lDir, "/sync-queue"),
+				},
+			}
+			replBackends = append(replBackends, syncFrom)
+		}
+
 		syncArgs := map[string]interface{}{
-			"from": "/bs/",
+			//"from": "/bs/",
+			"from": syncFrom,
 			"to":   params.indexerPath,
 		}
 		// TODO(mpl): Brad says the cond should be dest == /index-*.
 		// But what about when dest is index-mem and we have a local disk;
 		// don't we want to have an active synchandler to do the fullSyncOnStart?
 		// Anyway, that condition works for now.
-		if params.blobPath == "" {
+		if params.blobPath == "" || params.diskPack == "" {
 			// When our primary blob store is remote (s3 or google cloud),
 			// i.e not an efficient replication source, we do not want the
 			// synchandler to mirror to the indexer. But we still want a
@@ -469,7 +497,7 @@ func genLowLevelPrefixes(params *configPrefixesParams, ownerName string) (m json
 		m["/bs-and-index/"] = map[string]interface{}{
 			"handler": "storage-replica",
 			"handlerArgs": map[string]interface{}{
-				"backends": []interface{}{"/bs/", params.indexerPath},
+				"backends": replBackends,
 			},
 		}
 
@@ -511,6 +539,7 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 
 		// Blob storage options
 		blobPath           = conf.OptionalString("blobPath", "")
+		diskPack           = conf.OptionalString("diskPack", "")
 		s3                 = conf.OptionalString("s3", "")                 // "access_key_id:secret_access_key:bucket[:hostname]"
 		googlecloudstorage = conf.OptionalString("googlecloudstorage", "") // "clientId:clientSecret:refreshToken:bucket"
 		googledrive        = conf.OptionalString("googledrive", "")        // "clientId:clientSecret:refreshToken:parentId"
@@ -617,7 +646,7 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 		return nil, err
 	}
 
-	nolocaldisk := blobPath == ""
+	nolocaldisk := blobPath == "" && diskPack == ""
 	if nolocaldisk {
 		if s3 == "" && googlecloudstorage == "" {
 			return nil, errors.New("You need at least one of blobPath (for localdisk) or s3 or googlecloudstorage configured for a blobserver.")
@@ -636,6 +665,7 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 		keyId:            keyId,
 		indexerPath:      indexerPath,
 		blobPath:         blobPath,
+		diskPack:         diskPack,
 		searchOwner:      blob.SHA1FromString(armoredPublicKey),
 		shareHandlerPath: shareHandlerPath,
 	}
@@ -649,7 +679,11 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 		// See http://code.google.com/p/camlistore/issues/detail?id=85
 		cacheDir = filepath.Join(tempDir(), "camli-cache")
 	} else {
-		cacheDir = filepath.Join(blobPath, "cache")
+		if blobPath == "" {
+			cacheDir = filepath.Join(diskPack, "cache")
+		} else {
+			cacheDir = filepath.Join(blobPath, "cache")
+		}
 	}
 	if !noMkdir {
 		if err := os.MkdirAll(cacheDir, 0700); err != nil {
