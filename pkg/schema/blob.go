@@ -383,6 +383,20 @@ func (bb *Builder) SetModTime(t time.Time) *Builder {
 	return bb
 }
 
+// SetCreationTime sets the "unixCtime" field.
+func (bb *Builder) ForgeCreationTime() *Builder {
+	if bb.m["unixCtime"] == nil || bb.m["unixMtime"] == nil {
+		return bb
+	}
+	ctime := bb.m["unixCtime"].(string)
+	mtime := bb.m["unixMtime"].(string)
+
+	if ctime != "" && ctime > mtime {
+		bb.m["unixCtime"] = mtime
+	}
+	return bb
+}
+
 // ModTime returns the "unixMtime" modtime field, if set.
 func (bb *Builder) ModTime() (t time.Time, ok bool) {
 	s, ok := bb.m["unixMtime"].(string)

@@ -52,6 +52,7 @@ type fileCmd struct {
 	filePermanodes bool // make planned permanodes for each file (based on their digest)
 	vivify         bool
 	exifTime       bool // use metadata (such as in EXIF) to find the creation time of the file
+	forgeCtime     bool // use mtime as creation time of the file, if it would be bigger than modification time
 	diskUsage      bool // show "du" disk usage only (dry run mode), don't actually upload
 	argsFromInput  bool // Android mode: filenames piped into stdin, one at a time.
 
@@ -74,6 +75,7 @@ func init() {
 				" file. This permits the server to have your signing key. Used mostly with untrusted"+
 				" or at-risk clients, such as phones.")
 		flags.BoolVar(&cmd.exifTime, "exiftime", false, "Try to use metadata (such as EXIF) to get a stable creation time. If found, used as the replacement for the modtime. Mainly useful with vivify or filenodes.")
+		flags.BoolVar(&cmd.forgeCtime, "forgectime", false, "Use file modification time as creation time if it would be bigger (newer) than modification time. For stable filenode creation (you can forge mtime, but can't forge ctime).")
 		flags.StringVar(&cmd.title, "title", "", "Optional title attribute to set on permanode when using -permanode.")
 		flags.StringVar(&cmd.tag, "tag", "", "Optional tag(s) to set on permanode when using -permanode or -filenodes. Single value or comma separated.")
 
@@ -144,10 +146,11 @@ func (c *fileCmd) RunCommand(args []string) error {
 		}
 	}
 	up.fileOpts = &fileOptions{
-		permanode: c.filePermanodes,
-		tag:       c.tag,
-		vivify:    c.vivify,
-		exifTime:  c.exifTime,
+		permanode:  c.filePermanodes,
+		tag:        c.tag,
+		vivify:     c.vivify,
+		exifTime:   c.exifTime,
+		forgeCtime: c.forgeCtime,
 	}
 
 	var (
@@ -515,6 +518,9 @@ func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
 		} else {
 			filebb.SetModTime(modtime)
 		}
+	}
+	if up.fileOpts.forgeCtime {
+		filebb.ForgeCreationTime()
 	}
 
 	var (
