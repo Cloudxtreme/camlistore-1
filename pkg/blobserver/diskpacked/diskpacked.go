@@ -80,6 +80,9 @@ func New(root string) (*storage, error) {
 	if err := s.openCurrent(); err != nil {
 		return nil, err
 	}
+	if _, _, err := s.StorageGeneration(); err != nil {
+		return nil, fmt.Errorf("Error initialization generation for %q: %v", root, err)
+	}
 	return s, nil
 }
 
