@@ -228,10 +228,29 @@ func (s *storage) filename(file int64) string {
 	return filepath.Join(s.root, fmt.Sprintf("pack-%05d.blobs", file))
 }
 
+var removeGate = syncutil.NewGate(20) // arbitrary
+
 // RemoveBlobs removes the blobs from index and pads data with zero bytes
 func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
-	// TODO(adg): remove blob from index and pad data with spaces
-	return errors.New("diskpacked: RemoveBlobs not implemented")
+	batch := s.index.BeginBatch()
+	var wg syncutil.Group
+	for _, br := range blobs {
+		br := br
+		removeGate.Start()
+		wg.Go(func() error {
+			if err := s.delete(br); err != nil {
+				return err
+			}
+			batch.Delete(br.String())
+			return nil
+		})
+	}
+	err1 := wg.Err()
+	err2 := s.index.CommitBatch(batch)
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 var statGate = syncutil.NewGate(20) // arbitrary
