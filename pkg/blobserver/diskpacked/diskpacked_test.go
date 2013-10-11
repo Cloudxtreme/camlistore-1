@@ -17,13 +17,17 @@ limitations under the License.
 package diskpacked
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
+	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/blobserver/storagetest"
+	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/test"
 )
@@ -50,7 +54,14 @@ func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) (sto blo
 	}
 	return s, func() {
 		s.Close()
-		os.RemoveAll(dir)
+
+		testRemove(t, dir)
+
+		if camliDebug {
+			t.Logf("CAMLI_DEBUG set, skipping cleanup of dir %q", dir)
+		} else {
+			os.RemoveAll(dir)
+		}
 	}
 }
 
@@ -105,5 +116,77 @@ func TestDoubleReceive(t *testing.T) {
 	sizePostDelete := size(1)
 	if sizePostDelete < blobSize {
 		t.Fatalf("after packfile delete + reupload, not big enough. want size of a blob")
+	}
+}
+
+func testRemove(t *testing.T, dir string) {
+	s, err := newStorage(dir, 1<<20, jsonconfig.Obj{})
+	if err != nil {
+		t.Fatalf("newStorage: %v", err)
+	}
+	var closeOnce sync.Once
+	closeSto := func() { s.Close() }
+	defer closeOnce.Do(closeSto)
+
+	errch := make(chan error, 10)
+	var errs []string
+	go func() {
+		for err := range errch {
+			errs = append(errs, err.Error())
+		}
+	}()
+
+	b1 := &test.Blob{"add one, to have remaining :)"}
+	if _, err = s.ReceiveBlob(b1.BlobRef(), b1.Reader()); err != nil {
+		t.Fatalf("ReceiveBlob of %s: %v", b1, err)
+	}
+
+	// remove all remaining
+	sbc := make(chan blob.SizedRef, 10)
+	go func() {
+		if err := s.EnumerateBlobs(context.New(), sbc, "", 1000); err != nil {
+			errch <- fmt.Errorf("EnumerateBlobs: %v", err)
+		}
+	}()
+	var blobRefs []blob.Ref
+	for sb := range sbc {
+		blobRefs = append(blobRefs, sb.Ref)
+	}
+	t.Logf("enumeration blobRefs=%q errs=%q", blobRefs, errs)
+	close(errch)
+	if len(errs) > 0 {
+		t.Errorf("error enumerating blobs: %s", errs)
+	}
+	if len(blobRefs) > 0 {
+		if err := s.RemoveBlobs(blobRefs); err != nil {
+			t.Errorf("error removing %v: %v", blobRefs)
+			t.FailNow()
+		}
+	}
+	closeOnce.Do(closeSto)
+
+	ctx := context.TODO()
+
+	// check deleteds
+	n := 0
+	if err = s.Walk(ctx,
+		func(packID int, ref blob.Ref, offset int64, size uint32) error {
+			//t.Logf("ref %q in %d at %d size=%d", ref, packId, offset, size)
+			if size == 0 {
+				t.Errorf("zero sized blob at %d in %d (%s)", offset, packID, ref)
+			}
+			if ref.Valid() {
+				t.Errorf("valid blob remained at %d in %d (%s)", offset, packID, ref)
+			} else {
+				n++
+			}
+			return nil
+		}); err != nil {
+		t.Errorf("error walking %q: %v", s.root, err)
+	}
+	if n == 0 {
+		t.Errorf("no deleted blob found in %q", s.root)
+	} else {
+		t.Logf("found %d deleted blobs in %q", n, s.root)
 	}
 }
