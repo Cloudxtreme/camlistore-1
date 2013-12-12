@@ -32,6 +32,7 @@ package diskpacked
 
 import (
 	"bytes"
+	"compress/zlib"
 	"errors"
 	"fmt"
 	"io"
@@ -43,17 +44,25 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/blobserver/local"
+	"camlistore.org/pkg/constants"
 	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/readerutil"
 	"camlistore.org/pkg/sorted"
 	"camlistore.org/pkg/sorted/kvfile"
 	"camlistore.org/pkg/syncutil"
-	"camlistore.org/pkg/types"
 	"camlistore.org/third_party/github.com/camlistore/lock"
 )
 
 const defaultMaxFileSize = 512 << 20 // 512MB
+const compressionRatioThreshold = 0.75
+
+type transformID uint8
+
+const (
+	trIdent = transformID(0)
+	trZlib  = transformID(1)
+)
 
 type storage struct {
 	root        string
@@ -214,10 +223,6 @@ func (s *storage) Close() error {
 }
 
 func (s *storage) FetchStreaming(br blob.Ref) (io.ReadCloser, int64, error) {
-	return s.Fetch(br)
-}
-
-func (s *storage) Fetch(br blob.Ref) (types.ReadSeekCloser, int64, error) {
 	meta, err := s.meta(br)
 	if err != nil {
 		return nil, 0, err
@@ -227,10 +232,21 @@ func (s *storage) Fetch(br blob.Ref) (types.ReadSeekCloser, int64, error) {
 		return nil, 0, err
 	}
 	rsc := struct {
-		io.ReadSeeker
+		io.Reader
 		io.Closer
-	}{io.NewSectionReader(rac, meta.offset, meta.size), rac}
-	return rsc, meta.size, nil
+	}{io.NewSectionReader(rac, meta.offset, meta.diskSize), rac}
+	switch meta.transform {
+	case trIdent:
+		return rsc, meta.size, nil
+	case trZlib:
+		zr, err := zlib.NewReader(rsc)
+		if err != nil {
+			return nil, 0, err
+		}
+		return zr, meta.size, nil
+	default:
+		return nil, 0, fmt.Errorf("diskpacked: unknown transformID %d", meta.transform)
+	}
 }
 
 func (s *storage) filename(file int64) string {
@@ -302,19 +318,37 @@ func (s *storage) EnumerateBlobs(ctx *context.Context, dest chan<- blob.SizedRef
 }
 
 func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sbr blob.SizedRef, err error) {
-	// TODO(adg): write to temp file if blob exceeds some size (generalize code from s3)
 	var b bytes.Buffer
-	n, err := b.ReadFrom(source)
-	if err != nil {
+	z, _ := zlib.NewWriterLevel(&b, zlib.DefaultCompression)
+	n, err := io.CopyN(z, source, constants.MaxBlobSize+1)
+	if err != nil && err != io.EOF {
+		return
+	}
+	if n > constants.MaxBlobSize {
+		err = fmt.Errorf("blob %v too big", br)
+		return
+	}
+	if err = z.Close(); err != nil {
 		return
 	}
 	sbr = blob.SizedRef{Ref: br, Size: n}
-	err = s.append(sbr, &b)
+	ratio := float32(b.Len()) / float32(n)
+	if ratio < compressionRatioThreshold {
+		err = s.append(sbr, &b, int64(b.Len()), trZlib)
+	} else {
+		zr, zErr := zlib.NewReader(&b)
+		if zErr != nil {
+			err = zErr
+			return
+		}
+		defer zr.Close()
+		err = s.append(sbr, zr, n, trIdent)
+	}
 	return
 }
 
 // append writes the provided blob to the current data file.
-func (s *storage) append(br blob.SizedRef, r io.Reader) error {
+func (s *storage) append(br blob.SizedRef, r io.Reader, readerLen int64, trID transformID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -323,7 +357,10 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	if err := s.openCurrent(); err != nil {
 		return err
 	}
-	n, err := fmt.Fprintf(s.current, "[%v %v]", br.Ref.String(), br.Size)
+	if readerLen <= 0 {
+		readerLen = br.Size
+	}
+	n, err := fmt.Fprintf(s.current, "[%v %v %v %v]", br.Ref.String(), br.Size, readerLen, trID)
 	s.currentO += int64(n)
 	if err != nil {
 		return err
@@ -344,13 +381,14 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if n2 != br.Size {
-		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
+	if n2 != readerLen {
+		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, readerLen)
 	}
 	if err = s.current.Sync(); err != nil {
 		return err
 	}
-	return s.index.Set(br.Ref.String(), blobMeta{s.currentN, offset, br.Size}.String())
+	return s.index.Set(br.Ref.String(),
+		blobMeta{s.currentN, offset, br.Size, readerLen, trID}.String())
 }
 
 // meta fetches the metadata for the specified blob from the index.
@@ -371,16 +409,23 @@ func (s *storage) meta(br blob.Ref) (m blobMeta, err error) {
 
 // blobMeta is the blob metadata stored in the index.
 type blobMeta struct {
-	file, offset, size int64
+	file, offset, size, diskSize int64
+	transform                    transformID
 }
 
 func parseBlobMeta(s string) (m blobMeta, ok bool) {
-	n, err := fmt.Sscan(s, &m.file, &m.offset, &m.size)
-	return m, n == 3 && err == nil
+	n, err := fmt.Sscan(s, &m.file, &m.offset, &m.size, &m.diskSize, &m.transform)
+	if n == 5 && err == nil || n == 3 {
+		if m.diskSize <= 0 {
+			m.diskSize = m.size
+		}
+		return m, true
+	}
+	return m, false
 }
 
 func (m blobMeta) String() string {
-	return fmt.Sprintf("%v %v %v", m.file, m.offset, m.size)
+	return fmt.Sprintf("%v %v %v %v %v", m.file, m.offset, m.size, m.diskSize, m.transform)
 }
 
 func (m blobMeta) SizedRef(br blob.Ref) blob.SizedRef {

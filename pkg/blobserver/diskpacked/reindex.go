@@ -114,18 +114,19 @@ func reindexOne(index sorted.KeyValue, overwrite, verbose bool, r io.ReadSeeker,
 		if i <= 0 {
 			return errAt("", fmt.Sprintf("bad header format (no space in %q)", chunk))
 		}
-		if size, err = strconv.ParseInt(string(chunk[i+1:]), 10, 64); err != nil {
-			return errAt(fmt.Sprintf("cannot parse size %q as int", chunk[i+1:]), err.Error())
-		}
 		ref, ok := blob.Parse(string(chunk[:i]))
 		if !ok {
 			return errAt("", fmt.Sprintf("cannot parse %q as blobref", chunk[:i]))
 		}
+		bm := blobMeta{file: packId, offset: pos + 1 + int64(m)}
+		if _, err := fmt.Fscanf(bytes.NewReader(chunk[i+1:]), "%d %d %d", &bm.size, bm.diskSize, &bm.transform); err != nil {
+			return errAt("", fmt.Sprintf("cannot parse %q as \"size disksize transform\": %s", chunk[i+1:], err))
+		}
 		if verbose {
-			log.Printf("found %s at %d", ref, pos)
+			log.Printf("found %s at %d transformed with %s to %d", ref, pos, bm.transform, bm.diskSize)
 		}
 
-		meta := blobMeta{packId, pos + 1 + int64(m), size}.String()
+		meta := bm.String()
 		if overwrite && batch != nil {
 			batch.Set(ref.String(), meta)
 		} else {
