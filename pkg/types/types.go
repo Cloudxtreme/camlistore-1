@@ -131,3 +131,9 @@ type ReaderAtCloser interface {
 	io.ReaderAt
 	io.Closer
 }
+
+// ReadWriteSeekCloser is a composition of Reader + Writer + Seeker + Closer
+type ReadWriteSeekCloser interface {
+	io.ReadWriteSeeker
+	io.Closer
+}
