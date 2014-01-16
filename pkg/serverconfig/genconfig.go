@@ -276,6 +276,7 @@ func addS3Config(params *configPrefixesParams, prefixes jsonconfig.Obj, s3 strin
 			},
 		}
 	}
+
 	return nil
 }
 
@@ -378,6 +379,29 @@ func addGoogleCloudStorageConfig(prefixes jsonconfig.Obj, highCfg string) error 
 			"handlerArgs": map[string]interface{}{
 				"from": "/bs/",
 				"to":   gsPrefix,
+			},
+		}
+	}
+	return nil
+}
+
+func addMeasureConfig(prefixes jsonconfig.Obj, highCfg string) error {
+	if highCfg != "" {
+		prefixes["/measure/"] = map[string]interface{}{
+			"handler": "storage-measure",
+			"handlerArgs": map[string]interface{}{
+				"file": highCfg,
+			},
+		}
+		prefixes["/sync-to-measure/"] = map[string]interface{}{
+			"handler": "sync",
+			"handlerArgs": map[string]interface{}{
+				"from": "/bs/",
+				"to":   "/measure/",
+				"queue": map[string]interface{}{
+					"type": "kv",
+					"file": filepath.Join(tempDir(), "sync-to-measure-queue.kv"),
+				},
 			},
 		}
 	}
@@ -546,6 +570,8 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 		s3                 = conf.OptionalString("s3", "")                 // "access_key_id:secret_access_key:bucket[:hostname]"
 		googlecloudstorage = conf.OptionalString("googlecloudstorage", "") // "clientId:clientSecret:refreshToken:bucket"
 		googledrive        = conf.OptionalString("googledrive", "")        // "clientId:clientSecret:refreshToken:parentId"
+		measure            = conf.OptionalString("measure", "")            //path of measurement result txt
+
 		// Enable the share handler. If true, and shareHandlerPath is empty,
 		// then shareHandlerPath defaults to "/share/".
 		shareHandler = conf.OptionalBool("shareHandler", false)
@@ -735,6 +761,12 @@ func genLowLevelConfig(conf *Config) (lowLevelConf *Config, err error) {
 	}
 	if googlecloudstorage != "" {
 		if err := addGoogleCloudStorageConfig(prefixes, googlecloudstorage); err != nil {
+			return nil, err
+		}
+	}
+
+	if measure != "" {
+		if err := addMeasureConfig(prefixes, measure); err != nil {
 			return nil, err
 		}
 	}
