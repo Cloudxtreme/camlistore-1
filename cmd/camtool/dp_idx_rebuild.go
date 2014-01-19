@@ -34,12 +34,21 @@ type reindexdpCmd struct {
 	overwrite, verbose bool
 }
 
+type repackdpCmd struct {
+	verbose bool
+}
+
 func init() {
 	cmdmain.RegisterCommand("reindex-diskpacked",
 		func(flags *flag.FlagSet) cmdmain.CommandRunner {
 			cmd := new(reindexdpCmd)
 			flags.BoolVar(&cmd.overwrite, "overwrite", false,
 				"Whether to overwrite the existing index.kv. If false, only check.")
+			return cmd
+		})
+	cmdmain.RegisterCommand("repack-diskpacked",
+		func(flags *flag.FlagSet) cmdmain.CommandRunner {
+			cmd := new(repackdpCmd)
 			return cmd
 		})
 }
@@ -54,17 +63,42 @@ func (c *reindexdpCmd) Usage() {
 	fmt.Fprintln(os.Stderr, "       camtool reindex-diskpacked [--overwrite] /path/to/directory")
 }
 
+func (c *repackdpCmd) Describe() string {
+	return "Repack the .pack files of the diskpacked blob store - dropping deleted, recompressing blobs, rewriting with the latest format on the way"
+}
+
+func (c *repackdpCmd) Usage() {
+	fmt.Fprintln(os.Stderr, "Usage: camtool [globalopts] repack-diskpacked [repack-opts]")
+	fmt.Fprintln(os.Stderr, "       camtool repack-diskpacked")
+}
+
 func (c *reindexdpCmd) RunCommand(args []string) error {
-	var path string
+	path, err := getDpPath(args)
+	if err != nil {
+		return err
+	}
+	return diskpacked.Reindex(path, c.overwrite)
+}
+
+func (c *repackdpCmd) RunCommand(args []string) error {
+	path, err := getDpPath(args)
+	if err != nil {
+		return err
+	}
+	return diskpacked.Repack(path)
+}
+
+func getDpPath(args []string) (path string, err error) {
 	switch {
 	case len(args) == 0:
-		cfg, err := serverinit.Load(osutil.UserServerConfigPath())
-		if err != nil {
-			return err
+		cfg, e := serverinit.Load(osutil.UserServerConfigPath())
+		if e != nil {
+			return "", e
 		}
 		prefixes, ok := cfg.Obj["prefixes"].(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("No 'prefixes' object in low-level (or converted) config file %s", osutil.UserServerConfigPath())
+			err = fmt.Errorf("No 'prefixes' object in low-level (or converted) config file %s", osutil.UserServerConfigPath())
+			return
 		}
 		paths := []string{}
 		for prefix, vei := range prefixes {
@@ -92,21 +126,22 @@ func (c *reindexdpCmd) RunCommand(args []string) error {
 			}
 		}
 		if len(paths) == 0 {
-			return fmt.Errorf("Server config file %s doesn't specify a disk-packed storage handler.",
+			err = fmt.Errorf("Server config file %s doesn't specify a disk-packed storage handler.",
 				osutil.UserServerConfigPath())
+			return
 		}
 		if len(paths) > 1 {
-			return fmt.Errorf("Ambiguity. Server config file %s d specify more than 1 disk-packed storage handler. Please specify one of: %v", osutil.UserServerConfigPath(), paths)
+			err = fmt.Errorf("Ambiguity. Server config file %s d specify more than 1 disk-packed storage handler. Please specify one of: %v", osutil.UserServerConfigPath(), paths)
+			return
 		}
 		path = paths[0]
 	case len(args) == 1:
 		path = args[0]
 	default:
-		return errors.New("More than 1 argument not allowed")
+		return "", errors.New("More than 1 argument not allowed")
 	}
 	if path == "" {
-		return errors.New("no path is given/found")
+		return "", errors.New("no path is given/found")
 	}
-
-	return diskpacked.Reindex(path, c.overwrite)
+	return path, nil
 }

@@ -32,6 +32,7 @@ package diskpacked
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
@@ -71,12 +72,16 @@ func (d debugT) Println(args ...interface{}) {
 	}
 }
 
+// CurrentVersion is the version of the diskpacked file format
+const CurrentVersion = 1
+
 const defaultMaxFileSize = 512 << 20 // 512MB
 
 type storage struct {
 	root        string
 	index       sorted.KeyValue
 	maxFileSize int64
+	version     int
 
 	writeLock io.Closer // Provided by lock.Lock, and guards other processes from accesing the file open for writes.
 
@@ -122,6 +127,47 @@ func New(dir string) (blobserver.Storage, error) {
 		// and set maxSize to that?
 	}
 	return newStorage(dir, maxSize, nil)
+}
+
+var errBadVersion = errors.New("bad pack version")
+
+type item struct {
+	Ref         []byte `json:"r"`           // as Ref.MarshalBinary
+	Size        uint32 `json:"s"`           // on-disk (compressed) size
+	Compression uint8  `json:"c,omitempty"` // compression method
+	UncomprSize uint32 `json:"u,omitempty"` // original (uncompressed) size
+}
+
+// Encode item (diskpacked item header) as
+// "DISKPACKED" + uint8(headerLength) + json-encoded header
+func (it item) Encode(w io.Writer) (n int, err error) {
+	if n, err = io.WriteString(w, separator); err != nil {
+		return
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, 128))
+	if err = json.NewEncoder(buf).Encode(it); err != nil {
+		return
+	}
+	b := buf.Bytes()
+	if b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	if len(b) > 256 { // the limit with uint8
+		return 0, fmt.Errorf("Encode: header item too long (%d)", len(b))
+	}
+	if bw, ok := w.(io.ByteWriter); ok {
+		err = bw.WriteByte(uint8(len(b)))
+	} else {
+		_, err = w.Write([]byte{uint8(len(b))})
+	}
+	if err != nil {
+		return
+	}
+	n++
+
+	m, err := w.Write(b)
+	n += m
+	return
 }
 
 // newStorage returns a new storage in path root with the given maxFileSize,
@@ -204,6 +250,10 @@ func (s *storage) openForRead(n int) error {
 	if err != nil {
 		return err
 	}
+	s.version, err = getVersion(f)
+	if err != nil {
+		return err
+	}
 	openFdsVar.Add(s.root, 1)
 	debug.Printf("diskpacked: opened for read %q", fn)
 	s.fds = append(s.fds, f)
@@ -213,6 +263,8 @@ func (s *storage) openForRead(n int) error {
 // openForWrite will create or open pack file n for writes, create a lock
 // visible external to the process and seek to the end of the file ready for
 // appending new data.
+// This will return errBadVersion if the pack file exists and has different
+// version as we will write.
 // This function is not thread safe, s.mu should be locked by the caller.
 func (s *storage) openForWrite(n int) error {
 	fn := s.filename(n)
@@ -225,12 +277,39 @@ func (s *storage) openForWrite(n int) error {
 		l.Close()
 		return err
 	}
+	if v, err := getVersion(f); err != nil {
+		if err == io.EOF { // empty file
+			if err = f.Truncate(0); err != nil {
+				l.Close()
+				return err
+			}
+			// truncate and go on
+		} else {
+			f.Close()
+			l.Close()
+			return err
+		}
+	} else if v < CurrentVersion {
+		log.Printf("file %q has version %d, but current version is %d", v, CurrentVersion)
+		f.Close()
+		l.Close()
+		return errBadVersion
+	} else {
+		s.version = v
+	}
 	openFdsVar.Add(s.root, 1)
 	debug.Printf("diskpacked: opened for write %q", fn)
 
 	s.size, err = f.Seek(0, os.SEEK_END)
 	if err != nil {
 		return err
+	}
+	if s.size == 0 {
+		n, err := writeVersionTag(f)
+		if err != nil {
+			return err
+		}
+		s.size += int64(n)
 	}
 
 	s.writer = f
@@ -261,7 +340,16 @@ func (s *storage) nextPack() error {
 
 	n := len(s.fds)
 	if err := s.openForWrite(n); err != nil {
-		return err
+		if err == errBadVersion { // try again
+			// open "old" for reading, and create a new for writing
+			if err = s.openForRead(n); err == nil {
+				n++
+				err = s.openForWrite(n)
+			}
+		}
+		if err != nil {
+			return err
+		}
 	}
 	return s.openForRead(n)
 }
@@ -290,7 +378,16 @@ func (s *storage) openAllPacks() error {
 	}
 
 	// If 1 or more pack files are found, open the last one read and write.
-	return s.openForWrite(n - 1)
+	err := s.openForWrite(n - 1)
+	if err == errBadVersion { // try again
+		// open the "old" for reading, and create a new for writing
+		if err = s.openForRead(n - 1); err != nil {
+			s.Close()
+			return err
+		}
+		err = s.openForWrite(n)
+	}
+	return err
 }
 
 func (s *storage) Close() error {
@@ -470,36 +567,15 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 		return errors.New("diskpacked: write to closed storage")
 	}
 
+	offset, n, err := appendBlob(s.writer, br, r)
+	if err != nil {
+		return err
+	}
 	fn := s.writer.Name()
-	n, err := fmt.Fprintf(s.writer, "[%v %v]", br.Ref.String(), br.Size)
-	s.size += int64(n)
-	writeVar.Add(fn, int64(n))
-	writeTotVar.Add(s.root, int64(n))
-	if err != nil {
-		return err
-	}
+	s.size = offset + int64(br.Size)
+	writeVar.Add(fn, n)
+	writeTotVar.Add(s.root, n)
 
-	// TODO(adg): remove this seek and the offset check once confident
-	offset, err := s.writer.Seek(0, os.SEEK_CUR)
-	if err != nil {
-		return err
-	}
-	if offset != s.size {
-		return fmt.Errorf("diskpacked: seek says offset = %d, we think %d",
-			offset, s.size)
-	}
-	offset = s.size // make this a declaration once the above is removed
-
-	n2, err := io.Copy(s.writer, r)
-	s.size += n2
-	writeVar.Add(fn, int64(n))
-	writeTotVar.Add(s.root, int64(n))
-	if err != nil {
-		return err
-	}
-	if n2 != int64(br.Size) {
-		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
-	}
 	if err = s.writer.Sync(); err != nil {
 		return err
 	}
@@ -511,6 +587,39 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 		}
 	}
 	return s.index.Set(br.Ref.String(), blobMeta{packIdx, offset, br.Size}.String())
+}
+
+// appendBlob writes the provided blob to the provided data file
+func appendBlob(w io.WriteSeeker, br blob.SizedRef, r io.Reader) (offset, written int64, err error) {
+	p, e := w.Seek(0, os.SEEK_CUR)
+	if e != nil {
+		err = e
+		return
+	}
+	refBytes, e := br.Ref.MarshalBinary()
+	if e != nil {
+		err = e
+		return
+	}
+	n, err := item{Ref: refBytes, Size: uint32(br.Size)}.Encode(w)
+	// TODO(adg): remove this seek and the offset check once confident
+	if offset, err = w.Seek(0, os.SEEK_CUR); err != nil {
+		return
+	}
+	if p+int64(n) != offset {
+		err = fmt.Errorf("diskpacked: seek says offset = %d, we think %d", offset, p+int64(n))
+		return
+	}
+
+	n2, err := io.Copy(w, r)
+	if err != nil {
+		return
+	}
+	if n2 != int64(br.Size) {
+		err = fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n2, br.Size)
+		return
+	}
+	return offset, int64(n) + n2, nil
 }
 
 // meta fetches the metadata for the specified blob from the index.

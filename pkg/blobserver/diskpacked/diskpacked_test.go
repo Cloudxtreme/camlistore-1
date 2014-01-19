@@ -26,6 +26,7 @@ import (
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
 	"camlistore.org/pkg/blobserver/storagetest"
+	"camlistore.org/pkg/context"
 	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/test"
 )
@@ -56,7 +57,10 @@ func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) (sto blo
 		if camliDebug {
 			t.Logf("CAMLI_DEBUG set, skipping cleanup of dir %q", dir)
 		} else {
-			os.RemoveAll(dir)
+			defer os.RemoveAll(dir)
+		}
+		if err = Repack(s.root); err != nil {
+			t.Errorf("error repacking %q: %v", s.root, err)
 		}
 	}
 }
@@ -188,11 +192,41 @@ func TestDelete(t *testing.T) {
 			stepCheck(A, B),
 		},
 	}
+	ctx := context.TODO()
+	disk := sto.(*storage)
 	for i, steps := range deleteTests {
 		for j, s := range steps {
 			if err := s(); err != nil {
 				t.Errorf("error at test %d, step %d: %v", i+1, j+1, err)
 			}
+
+			if err := disk.Walk(ctx,
+				func(packID int, ref blob.SizedRef, offset int64, size uint32) error {
+					//t.Logf("%d/%d: %s (%d)", packID, offset, ref, size)
+					return nil
+				}); err != nil {
+				t.Errorf("Walk error: %v", err)
+			}
+		}
+	}
+
+}
+
+func TestVersionSniff(t *testing.T) {
+	for i, str := range []struct {
+		str string
+		v   int
+	}{
+		{`[sha1-3243`, 0},
+		{`V1aaaa`, 1},
+		{`DISKP`, -1},
+	} {
+		v, err := getVersion(strings.NewReader(str.str))
+		if err != nil && err != ErrUnknownVersion {
+			t.Errorf("error at step %d: %v", i, err)
+		}
+		if v != str.v {
+			t.Errorf("Step %d: bad version number: got %d, awaited %d.", i, v, str.v)
 		}
 	}
 }

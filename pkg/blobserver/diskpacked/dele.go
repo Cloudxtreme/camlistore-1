@@ -18,6 +18,7 @@ package diskpacked
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -43,16 +44,29 @@ func (s *storage) delete(br blob.Ref) error {
 	}
 	defer f.Close()
 
+	switch s.version {
+	case 0:
+		return deleteV0(f, br, meta)
+	case 1:
+		return deleteV1(f, br, meta)
+	default:
+		return ErrUnknownVersion
+	}
+}
+
+func deleteV0(f *os.File, br blob.Ref, meta blobMeta) error {
 	// walk back, find the header, and overwrite the hash with xxxx-000000...
 	k := 1 + len(br.String()) + 1 + len(strconv.FormatUint(uint64(meta.size), 10)) + 1
 	off := meta.offset - int64(k)
 	b := make([]byte, k)
-	if k, err = f.ReadAt(b, off); err != nil {
+	k, err := f.ReadAt(b, off)
+	if err != nil {
 		return err
 	}
 	if b[0] != byte('[') || b[k-1] != byte(']') {
 		return fmt.Errorf("delete: cannot find header surroundings, found %q", b)
 	}
+	// TODO(tgulacsi): check whether this sha1-xxx is the same as br!
 	b = b[1 : k-1] // "sha1-xxxxxxxxxxxxxxxxxx nnnn" - everything between []
 	off += 1
 
@@ -72,8 +86,83 @@ func (s *storage) delete(br blob.Ref) error {
 		b[i] = '0'
 	}
 
+	return writeBackAndZero(f, b, off, meta)
+}
+
+func deleteV1(f *os.File, br blob.Ref, meta blobMeta) error {
+	// walk back, find the header, and overwrite the hash with xxxx-000000...
+	k := 256
+	off := meta.offset - int64(k)
+	if off < 0 {
+		k += int(off)
+		off = 0
+	}
+	off, err := f.Seek(off, os.SEEK_SET)
+	if err != nil {
+		return err
+	}
+	b := make([]byte, k)
+	if k, err = io.ReadFull(f, b); err != nil {
+		return err
+	}
+	if k < len(b) {
+		b = b[:k]
+	}
+	if b[len(b)-1] != '}' {
+		return fmt.Errorf("delete: cannot find header end, found %q", b)
+	}
+	if k = bytes.LastIndex(b, []byte(separator)); k < 0 {
+		return fmt.Errorf("delete: cannot find header begin, found %q", b)
+	}
+	b = b[k+len(separator)+1:]
+	if b[0] != '{' {
+		return fmt.Errorf("delete: bad header begin, found %q", b)
+	}
+	if k = bytes.Index(b, []byte("\"r\":\"")); k < 0 {
+		return fmt.Errorf("delete: cannot find \"r\":\" in header %q", b)
+	}
+	b = b[k+5:]
+	off = meta.offset - int64(len(b))
+	if k = bytes.IndexByte(b, '"'); k < 0 {
+		return fmt.Errorf("delete: cannot find ending \" in header %q", b)
+	}
+	// base64-encoded sha1-xxxxxxxxxxxxxxxxxxxx
+	brb := make([]byte, base64.StdEncoding.DecodedLen(k))
+	n, err := base64.StdEncoding.Decode(brb, b[:k])
+	if err != nil {
+		return fmt.Errorf("delete: bad ref (%q): %v", b, err)
+	}
+	if n != len(brb) {
+		brb = brb[:n]
+	}
+	br2 := &blob.Ref{}
+	if err = br2.UnmarshalBinary(brb); err != nil {
+		return fmt.Errorf("delete: cannot unmarshal %q as blob ref: %v", brb, err)
+	}
+	if *br2 != br {
+		return fmt.Errorf("delete: found %s in place of %s", br2, br)
+	}
+
+	// Replace b with "xxxx-000000000"
+	dash := bytes.IndexByte(brb, '-')
+	if dash < 0 {
+		return fmt.Errorf("delete: cannot find dash in ref %q", b)
+	}
+	for i := 0; i < dash; i++ {
+		brb[i] = 'x'
+	}
+	for i := dash + 1; i < len(brb); i++ {
+		brb[i] = 0
+	}
+	base64.StdEncoding.Encode(b, brb)
+
+	return writeBackAndZero(f, b, off, meta)
+}
+
+func writeBackAndZero(f *os.File, b []byte, off int64, meta blobMeta) error {
 	// write back
-	if _, err = f.WriteAt(b, off); err != nil {
+	_, err := f.WriteAt(b, off)
+	if err != nil {
 		return err
 	}
 

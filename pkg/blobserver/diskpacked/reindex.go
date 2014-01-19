@@ -17,11 +17,8 @@ limitations under the License.
 package diskpacked
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -82,7 +79,7 @@ func (s *storage) reindexOne(ctx *context.Context, index sorted.KeyValue, overwr
 	// TODO(tgulacsi): proper verbose from context
 	verbose := camliDebug
 	err := s.walkPack(verbose, packID,
-		func(packID int, ref blob.Ref, offset int64, size uint32) error {
+		func(packID int, ref blob.SizedRef, offset int64, size uint32) error {
 			if !ref.Valid() {
 				if camliDebug {
 					log.Printf("found deleted blob in %d at %d with size %d", packID, offset, size)
@@ -125,7 +122,7 @@ func (s *storage) reindexOne(ctx *context.Context, index sorted.KeyValue, overwr
 // Walk walks the storage and calls the walker callback with each blobref
 // stops if walker returns non-nil error, and returns that
 func (s *storage) Walk(ctx *context.Context,
-	walker func(packID int, ref blob.Ref, offset int64, size uint32) error) error {
+	walker func(packID int, ref blob.SizedRef, offset int64, size uint32) error) error {
 
 	// TODO(tgulacsi): proper verbose flag from context
 	verbose := camliDebug
@@ -149,109 +146,21 @@ func (s *storage) Walk(ctx *context.Context,
 // walkPack walks the given pack and calls the walker callback with each blobref.
 // Stops if walker returns non-nil error and returns that.
 func (s *storage) walkPack(verbose bool, packID int,
-	walker func(packID int, ref blob.Ref, offset int64, size uint32) error) error {
+	walker func(packID int, ref blob.SizedRef, offset int64, size uint32) error) error {
 
 	fh, err := os.Open(s.filename(packID))
 	if err != nil {
 		return err
 	}
 	defer fh.Close()
-	name := fh.Name()
 
-	var (
-		pos  int64
-		size uint32
-		ref  blob.Ref
-	)
-
-	errAt := func(prefix, suffix string) error {
-		if prefix != "" {
-			prefix = prefix + " "
+	if err = walkOne(fh, func(head header, data io.Reader) error {
+		if err = walker(packID, head.Ref, head.DataOffset, head.Size); err != nil {
+			return fmt.Errorf("WalkPack(%d: %s): %v", packID, fh.Name(), err)
 		}
-		if suffix != "" {
-			suffix = " " + suffix
-		}
-		return fmt.Errorf(prefix+"at %d (0x%x) in %q:"+suffix, pos, pos, name)
-	}
-
-	br := bufio.NewReaderSize(fh, 512)
-	for {
-		if b, err := br.ReadByte(); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return errAt("error while reading", err.Error())
-		} else if b != '[' {
-			return errAt(fmt.Sprintf("found byte 0x%x", b), "but '[' should be here!")
-		}
-		chunk, err := br.ReadSlice(']')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return errAt("error reading blob header", err.Error())
-		}
-		m := len(chunk)
-		chunk = chunk[:m-1]
-		i := bytes.IndexByte(chunk, byte(' '))
-		if i <= 0 {
-			return errAt("", fmt.Sprintf("bad header format (no space in %q)", chunk))
-		}
-		size64, err := strconv.ParseUint(string(chunk[i+1:]), 10, 32)
-		if err != nil {
-			return errAt(fmt.Sprintf("cannot parse size %q as int", chunk[i+1:]), err.Error())
-		}
-		size = uint32(size64)
-
-		// maybe deleted?
-		state, deleted := 0, true
-		if chunk[0] == 'x' {
-		Loop:
-			for _, c := range chunk[:i] {
-				switch state {
-				case 0:
-					if c != 'x' {
-						if c == '-' {
-							state++
-						} else {
-							deleted = false
-							break Loop
-						}
-					}
-				case 1:
-					if c != '0' {
-						deleted = false
-						break Loop
-					}
-				}
-			}
-		}
-		if deleted {
-			ref = blob.Ref{}
-			if verbose {
-				log.Printf("found deleted at %d", pos)
-			}
-		} else {
-			ref, ok := blob.Parse(string(chunk[:i]))
-			if !ok {
-				return errAt("", fmt.Sprintf("cannot parse %q as blobref", chunk[:i]))
-			}
-			if verbose {
-				log.Printf("found %s at %d", ref, pos)
-			}
-		}
-		if err = walker(packID, ref, pos+1+int64(m), size); err != nil {
-			return err
-		}
-
-		pos += 1 + int64(m)
-		// TODO(tgulacsi): not just seek, but check the hashes of the files
-		// maybe with a different command-line flag, only.
-		if pos, err = fh.Seek(pos+int64(size), 0); err != nil {
-			return errAt("", "cannot seek +"+strconv.FormatUint(size64, 10)+" bytes")
-		}
-		// drain the buffer after the underlying reader Seeks
-		io.CopyN(ioutil.Discard, br, int64(br.Buffered()))
+		return nil
+	}); err != nil {
+		return err
 	}
 	return nil
 }
