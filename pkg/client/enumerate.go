@@ -117,7 +117,7 @@ func (c *Client) EnumerateBlobsOpts(ctx *context.Context, ch chan<- blob.SizedRe
 				return error("item in 'blobs' had invalid blobref.", nil)
 			}
 			select {
-			case ch <- blob.SizedRef{Ref: br, Size: size}:
+			case ch <- blob.SizedRef{Ref: br, Size: uint32(size)}:
 			case <-ctx.Done():
 				return context.ErrCanceled
 			}

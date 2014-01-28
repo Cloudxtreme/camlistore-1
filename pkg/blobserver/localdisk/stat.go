@@ -17,6 +17,8 @@ limitations under the License.
 package localdisk
 
 import (
+	"errors"
+	"math"
 	"os"
 
 	"camlistore.org/pkg/blob"
@@ -36,7 +38,10 @@ func (ds *DiskStorage) StatBlobs(dest chan<- blob.SizedRef, blobs []blob.Ref) er
 		fi, err := os.Stat(ds.blobPath(ref))
 		switch {
 		case err == nil && fi.Mode().IsRegular():
-			dest <- blob.SizedRef{Ref: ref, Size: fi.Size()}
+			if fi.Size() > math.MaxUint32 {
+				return errors.New("file too big")
+			}
+			dest <- blob.SizedRef{Ref: ref, Size: uint32(fi.Size())}
 			return nil
 		case err != nil && !os.IsNotExist(err):
 			return err
