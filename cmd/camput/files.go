@@ -67,6 +67,8 @@ type fileCmd struct {
 
 var flagUseSQLiteChildCache bool // Use sqlite for the statcache and havecache.
 
+var uploadWorkers = -1 // concurrent upload workers
+
 func init() {
 	cmdmain.RegisterCommand("file", func(flags *flag.FlagSet) cmdmain.CommandRunner {
 		cmd := new(fileCmd)
@@ -94,6 +96,8 @@ func init() {
 		}
 		if android.IsChild() {
 			flags.BoolVar(&cmd.argsFromInput, "stdinargs", false, "If true, filenames to upload are sent one-per-line on stdin. EOF means to quit the process with exit status 0.")
+			// limit number of goroutines to limit memory
+			uploadWorkers = 3
 		}
 		flagCacheLog = flags.Bool("logcache", false, "log caching details")
 
@@ -543,20 +547,22 @@ func (up *Uploader) uploadNodeRegularFile(n *node) (*client.PutResult, error) {
 		return nil, err
 	}
 	defer file.Close()
-	if up.fileOpts.exifTime {
-		ra, ok := file.(io.ReaderAt)
-		if !ok {
-			return nil, errors.New("Error asserting local file to io.ReaderAt")
+	if up.fileOpts != nil {
+		if up.fileOpts.exifTime {
+			ra, ok := file.(io.ReaderAt)
+			if !ok {
+				return nil, errors.New("Error asserting local file to io.ReaderAt")
+			}
+			modtime, err := schema.FileTime(ra)
+			if err != nil {
+				log.Printf("warning: getting time from EXIF failed for %v: %v", n.fullPath, err)
+			} else {
+				filebb.SetModTime(modtime)
+			}
 		}
-		modtime, err := schema.FileTime(ra)
-		if err != nil {
-			log.Printf("warning: getting time from EXIF failed for %v: %v", n.fullPath, err)
-		} else {
-			filebb.SetModTime(modtime)
+		if up.fileOpts.capCtime {
+			filebb.CapCreationTime()
 		}
-	}
-	if up.fileOpts.capCtime {
-		filebb.CapCreationTime()
 	}
 
 	var (
@@ -932,7 +938,7 @@ func (t *TreeUpload) statPath(fullPath string, fi os.FileInfo) (nod *node, err e
 	if err != nil {
 		return nil, err
 	}
-	sort.Sort(byFileName(fis))
+	sort.Sort(byTypeAndName(fis))
 	for _, fi := range fis {
 		depn, err := t.statPath(filepath.Join(fullPath, filepath.Base(fi.Name())), fi)
 		if err != nil {
@@ -1000,9 +1006,9 @@ func (t *TreeUpload) run() {
 			}
 		})
 	} else {
-		upload = NewNodeWorker(-1, func(n *node, ok bool) {
+		upload = NewNodeWorker(uploadWorkers, func(n *node, ok bool) {
 			if !ok {
-				log.Printf("done with all uploads.")
+				log.Println("done with all uploads.")
 				uploadsdonec <- true
 				return
 			}
@@ -1011,9 +1017,11 @@ func (t *TreeUpload) run() {
 				log.Fatalf("Error uploading %s: %v", n.fullPath, err)
 			}
 			n.SetPutResult(put, nil)
-			if c := t.up.statCache; c != nil && !n.fi.IsDir() {
-				c.AddCachedPutResult(
-					t.up.pwd, n.fullPath, n.fi, put, withPermanode)
+			if !n.fi.IsDir() {
+				if c := t.up.statCache; c != nil {
+					c.AddCachedPutResult(
+						t.up.pwd, n.fullPath, n.fi, put, withPermanode)
+				}
 			}
 			uploadedc <- n
 		})
@@ -1063,7 +1071,7 @@ Loop:
 			t.skipped.incr(n)
 		case n, ok := <-stattedc:
 			if !ok {
-				log.Printf("done stattting:")
+				log.Printf("done statting:")
 				dumpStats()
 				close(checkStatCache)
 				stattedc = nil
@@ -1107,11 +1115,21 @@ func (t *TreeUpload) Wait() (*client.PutResult, error) {
 	return t.finalPutRes, t.err
 }
 
-type byFileName []os.FileInfo
+type byTypeAndName []os.FileInfo
 
-func (s byFileName) Len() int           { return len(s) }
-func (s byFileName) Less(i, j int) bool { return s[i].Name() < s[j].Name() }
-func (s byFileName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s byTypeAndName) Len() int { return len(s) }
+func (s byTypeAndName) Less(i, j int) bool {
+	// files go before directories
+	if s[i].IsDir() {
+		if !s[j].IsDir() {
+			return false
+		}
+	} else if s[j].IsDir() {
+		return true
+	}
+	return s[i].Name() < s[j].Name()
+}
+func (s byTypeAndName) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
 // trackDigestReader is an io.Reader wrapper which records the digest of what it reads.
 type trackDigestReader struct {

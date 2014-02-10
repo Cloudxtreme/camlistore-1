@@ -46,6 +46,7 @@ var (
 var (
 	uploaderOnce sync.Once
 	uploader     *Uploader // initialized by getUploader
+	onceAddFlags sync.Once // guards client.AddFlags double invocation from tests
 )
 
 func init() {
@@ -54,7 +55,7 @@ func init() {
 		flag.BoolVar(&flagHaveCache, "havecache", true, "Use the 'have cache', a cache keeping track of what blobs the remote server should already have from previous uploads.")
 	}
 	cmdmain.ExtraFlagRegistration = func() {
-		client.AddFlags()
+		onceAddFlags.Do(client.AddFlags)
 	}
 	cmdmain.PreExit = func() {
 		if up := uploader; up != nil {
