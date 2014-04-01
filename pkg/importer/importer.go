@@ -23,6 +23,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -84,9 +85,8 @@ type Importer interface {
 	CallbackRequestAccount(r *http.Request) (acctRef blob.Ref, err error)
 
 	// CallbackURLParameters uses the input importer account blobRef to build
-	// and return the URL parameters string (including the prefixed "?"), that
-	// will be appended to the callback URL.
-	CallbackURLParameters(acctRef blob.Ref) string
+	// and return the URL parameters, that will be appended to the callback URL.
+	CallbackURLParameters(acctRef blob.Ref) url.Values
 }
 
 // ImporterSetupHTMLer is an optional interface that may be implemented by
@@ -99,7 +99,6 @@ var importers = make(map[string]Importer)
 
 func init() {
 	Register("flickr", TODOImporter)
-	Register("picasa", TODOImporter)
 }
 
 // Register registers a site-specific importer. It should only be called from init,
@@ -188,8 +187,11 @@ func (sc *SetupContext) Credentials() (clientID, clientSecret string, err error)
 }
 
 func (sc *SetupContext) CallbackURL() string {
-	return sc.Host.ImporterBaseURL() + sc.ia.im.name + "/callback" +
-		sc.ia.im.impl.CallbackURLParameters(sc.AccountNode.PermanodeRef())
+	params := sc.ia.im.impl.CallbackURLParameters(sc.AccountNode.PermanodeRef()).Encode()
+	if params != "" {
+		params = "?" + params
+	}
+	return sc.Host.ImporterBaseURL() + sc.ia.im.name + "/callback" + params
 }
 
 // AccountURL returns the URL to an account of an importer
@@ -381,7 +383,7 @@ func (h *Host) serveImporterAcctCallback(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	imp.impl.ServeCallback(w, r, &SetupContext{
-		Context:     context.TODO(),
+		Context:     ia.context(),
 		Host:        h,
 		AccountNode: ia.acct,
 		ia:          ia,
@@ -760,8 +762,9 @@ type importerAcct struct {
 	root *Object
 
 	mu           sync.Mutex
-	current      *RunContext // or nil if not running
-	stopped      bool        // stop requested (context canceled)
+	setupCtx     *context.Context // context for setup
+	current      *RunContext      // or nil if not running
+	stopped      bool             // stop requested (context canceled)
 	lastRunErr   error
 	lastRunStart time.Time
 	lastRunDone  time.Time
@@ -886,9 +889,28 @@ func (ia *importerAcct) serveHTTPPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, ia.AccountURL(), http.StatusFound)
 }
 
+// Context returns a non-nil Context, locking the importerAcct.
+func (ia *importerAcct) context() *context.Context {
+	ia.mu.Lock()
+	defer ia.mu.Unlock()
+	return ia.localContext()
+}
+
+// localContext returns a non-nil Context, not locking
+func (ia *importerAcct) localContext() *context.Context {
+	ctx := ia.setupCtx
+	if ia.current != nil {
+		ctx = ia.current.Context
+	} else {
+		ctx = context.New()
+		ia.setupCtx = ctx
+	}
+	return ctx
+}
+
 func (ia *importerAcct) setup(w http.ResponseWriter, r *http.Request) {
 	if err := ia.im.impl.ServeSetup(w, r, &SetupContext{
-		Context:     context.TODO(),
+		Context:     ia.localContext(),
 		Host:        ia.im.host,
 		AccountNode: ia.acct,
 		ia:          ia,
@@ -903,12 +925,16 @@ func (ia *importerAcct) start() {
 	if ia.current != nil {
 		return
 	}
-	ctx := context.New()
+	ctx := ia.setupCtx
+	if ctx == nil {
+		ctx = context.New()
+	}
 	rc := &RunContext{
 		Context: ctx,
 		Host:    ia.im.host,
 		ia:      ia,
 	}
+	ia.setupCtx = nil
 	ia.current = rc
 	ia.stopped = false
 	ia.lastRunStart = time.Now()
@@ -1066,6 +1092,48 @@ func (o *Object) SetAttrs(keyval ...string) error {
 		}
 	}
 	return g.Err()
+}
+
+// SetAttrValues sets multi-valued attribute.
+func (o *Object) SetAttrValues(key string, attrs []string) error {
+	exists := asSet(o.Attrs(key))
+	actual := asSet(attrs)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	// add new values
+	for v := range actual {
+		if exists[v] {
+			delete(exists, v)
+			continue
+		}
+		_, err := o.h.upload(schema.NewAddAttributeClaim(o.pn, key, v))
+		if err != nil {
+			return err
+		}
+	}
+	// delete unneeded values
+	for v := range exists {
+		_, err := o.h.upload(schema.NewDelAttributeClaim(o.pn, key, v))
+		if err != nil {
+			return err
+		}
+	}
+	if o.attr == nil {
+		o.attr = make(map[string][]string)
+	}
+	o.attr[key] = attrs
+	return nil
+}
+
+func asSet(elts []string) map[string]bool {
+	if len(elts) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(elts))
+	for _, elt := range elts {
+		set[elt] = true
+	}
+	return set
 }
 
 // ChildPathObject returns (creating if necessary) the child object

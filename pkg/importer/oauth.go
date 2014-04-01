@@ -18,7 +18,6 @@ package importer
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -39,8 +38,10 @@ func (OAuth1) CallbackRequestAccount(r *http.Request) (blob.Ref, error) {
 	return acctRef, nil
 }
 
-func (OAuth1) CallbackURLParameters(acctRef blob.Ref) string {
-	return "?acct=" + acctRef.String()
+func (OAuth1) CallbackURLParameters(acctRef blob.Ref) url.Values {
+	v := url.Values{}
+	v.Add("acct", acctRef.String())
+	return v
 }
 
 // OAuth2 provides methods that the importer implementations can use to
@@ -62,8 +63,10 @@ func (OAuth2) CallbackRequestAccount(r *http.Request) (blob.Ref, error) {
 	return acctRef, nil
 }
 
-func (OAuth2) CallbackURLParameters(acctRef blob.Ref) string {
-	return "?state=acct:" + acctRef.String()
+func (OAuth2) CallbackURLParameters(acctRef blob.Ref) url.Values {
+	v := url.Values{}
+	v.Set("state", "acct:"+acctRef.String())
+	return v
 }
 
 // RedirectURL returns the redirect URI that imp should set in an oauth.Config
@@ -76,17 +79,21 @@ func (OAuth2) RedirectURL(imp Importer, ctx *SetupContext) string {
 	fullCallback := ctx.CallbackURL()
 	queryPart := imp.CallbackURLParameters(ctx.AccountNode.PermanodeRef())
 	log.Printf("WARNING: callback URL %q has no query component", fullCallback)
-	return strings.TrimSuffix(fullCallback, queryPart)
+	u, _ := url.Parse(fullCallback)
+	v := u.Query()
+	// remove query params in CallbackURLParameters
+	for k := range queryPart {
+		v.Del(k)
+	}
+	u.RawQuery = v.Encode()
+	return u.String()
 }
 
 // RedirectState returns the "state" query parameter that should be used for the authorization
 // phase of OAuth2 authentication. This parameter contains the query component of the redirection
 // URI. See http://tools.ietf.org/html/rfc6749#section-3.1.2.2
 func (OAuth2) RedirectState(imp Importer, ctx *SetupContext) (state string, err error) {
-	m, err := url.ParseQuery(strings.TrimPrefix(imp.CallbackURLParameters(ctx.AccountNode.PermanodeRef()), "?"))
-	if err != nil {
-		return "", fmt.Errorf("could not parse callback parameters string as a query: %q", imp.CallbackURLParameters(ctx.AccountNode.PermanodeRef()))
-	}
+	m := imp.CallbackURLParameters(ctx.AccountNode.PermanodeRef())
 	state = m.Get("state")
 	if state == "" {
 		return "", errors.New("\"state\" not found in callback parameters")
