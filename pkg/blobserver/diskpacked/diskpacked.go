@@ -33,7 +33,6 @@ package diskpacked
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"expvar"
 	"fmt"
 	"io"
@@ -90,6 +89,8 @@ type storage struct {
 	size   int64
 
 	*local.Generationer
+
+	holes *holeList
 }
 
 func (s *storage) String() string {
@@ -105,6 +106,7 @@ var (
 )
 
 const indexKV = "index.kv"
+const holesKV = "holes.kv"
 
 // IsDir reports whether dir is a diskpacked directory.
 func IsDir(dir string) (bool, error) {
@@ -154,6 +156,15 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 			index.Close()
 		}
 	}()
+	holes, err := newHoleList(filepath.Join(root, holesKV))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			holes.Close()
+		}
+	}()
 	if maxFileSize <= 0 {
 		maxFileSize = defaultMaxFileSize
 	}
@@ -166,6 +177,7 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 		index:        index,
 		maxFileSize:  maxFileSize,
 		Generationer: local.NewGenerationer(root),
+		holes:        holes,
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -304,6 +316,9 @@ func (s *storage) Close() error {
 		s.closed = true
 		if err := s.index.Close(); err != nil {
 			log.Println("diskpacked: closing index:", err)
+		}
+		if err := s.holes.Close(); err != nil {
+			log.Println("diskpacked: closing holes:", err)
 		}
 		for _, f := range s.fds {
 			if err := f.Close(); err != nil {
@@ -615,91 +630,4 @@ func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sbr blob.SizedRef,
 
 	err = s.append(sbr, &b)
 	return
-}
-
-// append writes the provided blob to the current data file.
-func (s *storage) append(br blob.SizedRef, r io.Reader) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return errors.New("diskpacked: write to closed storage")
-	}
-
-	fn := s.writer.Name()
-	n, err := fmt.Fprintf(s.writer, "[%v %v]", br.Ref.String(), br.Size)
-	s.size += int64(n)
-	writeVar.Add(fn, int64(n))
-	writeTotVar.Add(s.root, int64(n))
-	if err != nil {
-		return err
-	}
-
-	// TODO(adg): remove this seek and the offset check once confident
-	offset, err := s.writer.Seek(0, os.SEEK_CUR)
-	if err != nil {
-		return err
-	}
-	if offset != s.size {
-		return fmt.Errorf("diskpacked: seek says offset = %d, we think %d",
-			offset, s.size)
-	}
-	offset = s.size // make this a declaration once the above is removed
-
-	n2, err := io.Copy(s.writer, r)
-	s.size += n2
-	writeVar.Add(fn, int64(n))
-	writeTotVar.Add(s.root, int64(n))
-	if err != nil {
-		return err
-	}
-	if n2 != int64(br.Size) {
-		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
-	}
-	if err = s.writer.Sync(); err != nil {
-		return err
-	}
-
-	packIdx := len(s.fds) - 1
-	if s.size > s.maxFileSize {
-		if err := s.nextPack(); err != nil {
-			return err
-		}
-	}
-	return s.index.Set(br.Ref.String(), blobMeta{packIdx, offset, br.Size}.String())
-}
-
-// meta fetches the metadata for the specified blob from the index.
-func (s *storage) meta(br blob.Ref) (m blobMeta, err error) {
-	ms, err := s.index.Get(br.String())
-	if err != nil {
-		if err == sorted.ErrNotFound {
-			err = os.ErrNotExist
-		}
-		return
-	}
-	m, ok := parseBlobMeta(ms)
-	if !ok {
-		err = fmt.Errorf("diskpacked: bad blob metadata: %q", ms)
-	}
-	return
-}
-
-// blobMeta is the blob metadata stored in the index.
-type blobMeta struct {
-	file   int
-	offset int64
-	size   uint32
-}
-
-func parseBlobMeta(s string) (m blobMeta, ok bool) {
-	n, err := fmt.Sscan(s, &m.file, &m.offset, &m.size)
-	return m, n == 3 && err == nil
-}
-
-func (m blobMeta) String() string {
-	return fmt.Sprintf("%v %v %v", m.file, m.offset, m.size)
-}
-
-func (m blobMeta) SizedRef(br blob.Ref) blob.SizedRef {
-	return blob.SizedRef{Ref: br, Size: m.size}
 }

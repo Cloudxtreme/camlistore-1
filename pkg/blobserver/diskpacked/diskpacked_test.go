@@ -123,6 +123,7 @@ func TestDelete(t *testing.T) {
 		A = &test.Blob{Contents: "some small blob"}
 		B = &test.Blob{Contents: strings.Repeat("some middle blob", 100)}
 		C = &test.Blob{Contents: strings.Repeat("A 8192 bytes length largish blob", 8192/32)}
+		D = &test.Blob{Contents: "tiny blob"}
 	)
 
 	type step func() error
@@ -161,31 +162,72 @@ func TestDelete(t *testing.T) {
 			return nil
 		}
 	}
+	stepCheckSize := func(size int64) step {
+		return func() error {
+			s, ok := sto.(*storage)
+			if !ok {
+				t.Logf("sto is not storage, but %T - cannot check size.", sto)
+				return nil
+			}
+			fi, err := os.Stat(s.filename(0))
+			if err != nil {
+				return err
+			}
+			if fi.Size() != size {
+				return fmt.Errorf("size mismatch: %q is %d bytes, wanted %d.", fi.Name(), fi.Size(), size)
+			}
+			return nil
+		}
+	}
 
 	var deleteTests = [][]step{
 		[]step{
+			stepCheckSize(0),
 			stepAdd(A),
+			stepCheckSize(65),
 			stepDelete(A),
+			stepCheckSize(65),
 			stepCheck(),
 			stepAdd(B),
+			stepCheckSize(1717),
 			stepCheck(B),
 			stepDelete(B),
+			stepCheckSize(1717),
 			stepCheck(),
 			stepAdd(C),
+			stepCheckSize(9961),
 			stepCheck(C),
 			stepAdd(A),
+			stepCheckSize(9961),
 			stepCheck(A, C),
 			stepDelete(A),
+			stepCheckSize(9961),
 			stepDelete(C),
+			stepCheckSize(9961),
 			stepCheck(),
 		},
 		[]step{
 			stepAdd(A),
 			stepAdd(B),
 			stepAdd(C),
+			stepCheckSize(10151),
 			stepCheck(A, B, C),
 			stepDelete(C),
+			stepCheckSize(10151),
 			stepCheck(A, B),
+		},
+		[]step{
+			stepAdd(A),
+			stepAdd(B),
+			stepAdd(C),
+			stepCheck(A, B, C),
+			stepCheckSize(18490),
+			stepDelete(C),
+			stepCheckSize(18490),
+			stepCheck(A, B),
+			stepAdd(D),
+			stepCheckSize(18490), // size must not change if a hole big enough is found
+			stepCheck(A, B, D),
 		},
 	}
 	for i, steps := range deleteTests {

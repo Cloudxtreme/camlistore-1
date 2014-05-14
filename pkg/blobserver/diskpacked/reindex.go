@@ -35,10 +35,9 @@ import (
 
 var camliDebug, _ = strconv.ParseBool(os.Getenv("CAMLI_DEBUG"))
 
-// Reindex rewrites the index files of the diskpacked .pack files
+// Reindex rewrites the index file and the holes file of the diskpacked .pack files
 func Reindex(root string, overwrite bool) (err error) {
 	// there is newStorage, but that may open a file for writing
-	var s = &storage{root: root}
 	index, err := kvfile.NewStorage(filepath.Join(root, indexKV))
 	if err != nil {
 		return err
@@ -52,7 +51,18 @@ func Reindex(root string, overwrite bool) (err error) {
 			err = closeErr
 		}
 	}()
+	holes, err := newHoleList(filepath.Join(root, holesKV))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeErr := holes.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
 
+	var s = &storage{root: root, index: index, holes: holes}
 	ctx := context.TODO() // TODO(tgulacsi): get the verbosity from context
 	for i := 0; i >= 0; i++ {
 		fh, err := os.Open(s.filename(i))
@@ -62,7 +72,7 @@ func Reindex(root string, overwrite bool) (err error) {
 			}
 			return err
 		}
-		err = s.reindexOne(ctx, index, overwrite, i)
+		err = s.reindexOne(ctx, overwrite, i)
 		fh.Close()
 		if err != nil {
 			return err
@@ -71,29 +81,53 @@ func Reindex(root string, overwrite bool) (err error) {
 	return nil
 }
 
-func (s *storage) reindexOne(ctx *context.Context, index sorted.KeyValue, overwrite bool, packID int) error {
+func (s *storage) reindexOne(ctx *context.Context, overwrite bool, packID int) error {
 
 	var batch sorted.BatchMutation
 	if overwrite {
-		batch = index.BeginBatch()
+		batch = s.index.BeginBatch()
 	}
 	allOk := true
 
 	// TODO(tgulacsi): proper verbose from context
 	verbose := camliDebug
+	lastPackID := -1
+	var lastPackFd *os.File
+	defer func() {
+		if lastPackFd != nil {
+			lastPackFd.Close()
+		}
+	}()
+
 	err := s.walkPack(verbose, packID,
 		func(packID int, ref blob.Ref, offset int64, size uint32) error {
 			if !ref.Valid() {
 				if camliDebug {
 					log.Printf("found deleted blob in %d at %d with size %d", packID, offset, size)
 				}
-				return nil
+				if lastPackID != packID {
+					if lastPackFd != nil {
+						lastPackFd.Close()
+					}
+					var err error
+					if lastPackFd, err = os.Open(s.filename(packID)); err != nil {
+						return fmt.Errorf("reindexOne(%d): %v", packID, err)
+					}
+				}
+
+				b, err := findHeaderBack(lastPackFd, len(ref.String()), offset, size)
+				if err != nil {
+					return fmt.Errorf("cannot find header of %s: %v", ref, err)
+				}
+				return s.holes.Add(hole{
+					blobMeta:  blobMeta{file: packID, offset: offset, size: size},
+					headerLen: uint16(len(b))})
 			}
 			meta := blobMeta{packID, offset, size}.String()
 			if overwrite && batch != nil {
 				batch.Set(ref.String(), meta)
 			} else {
-				if old, err := index.Get(ref.String()); err != nil {
+				if old, err := s.index.Get(ref.String()); err != nil {
 					allOk = false
 					if err == sorted.ErrNotFound {
 						log.Println(ref.String() + ": cannot find in index!")
@@ -112,8 +146,8 @@ func (s *storage) reindexOne(ctx *context.Context, index sorted.KeyValue, overwr
 	}
 
 	if overwrite && batch != nil {
-		log.Printf("overwriting %s from %d", index, packID)
-		if err = index.CommitBatch(batch); err != nil {
+		log.Printf("overwriting %s from %d", s.index, packID)
+		if err = s.index.CommitBatch(batch); err != nil {
 			return err
 		}
 	} else if !allOk {
