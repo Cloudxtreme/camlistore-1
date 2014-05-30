@@ -141,18 +141,16 @@ Meta format:
    <compressed>
 
 Where compressed has plaintext of:
-   #camlistore/encmeta=1
+   #camlistore/comprmeta=1
 Then sorted lines, each ending in a newline, like:
    sha1-plain/<metaValue>
 See the encodeMetaValue for the definition of metaValue, but in summary:
-   sha1-plain/<plaintext size>/<iv as %x>/sha1-encrypted/<encrypted size>
+   sha1-plain/<plaintext size>/<compression method name>/sha1-compressed/<compressed size>
 */
 
 func (s *storage) makeSingleMetaBlob(plainBR blob.Ref, meta string) []byte {
-	iv := s.randIV()
-
 	var plain bytes.Buffer
-	plain.WriteString("#camlistore/encmeta=1\n")
+	plain.WriteString("#camlistore/comprmeta=1\n")
 	plain.WriteString(plainBR.String())
 	plain.WriteByte('/')
 	plain.WriteString(meta)
@@ -350,7 +348,7 @@ func (s *storage) processEncryptedMetaBlob(br blob.Ref, dat []byte) error {
 	if !sc.Scan() {
 		return errors.New("No first line")
 	}
-	if sc.Text() != "#camlistore/encmeta=1" {
+	if sc.Text() != "#camlistore/comprmeta=1" {
 		line := sc.Text()
 		if len(line) > 80 {
 			line = line[:80]
