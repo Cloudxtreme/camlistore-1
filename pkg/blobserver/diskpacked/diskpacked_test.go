@@ -22,6 +22,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
@@ -31,22 +32,22 @@ import (
 )
 
 func newTempDiskpacked(t *testing.T) (sto blobserver.Storage, cleanup func()) {
-	return newTempDiskpackedWithIndex(t, jsonconfig.Obj{})
+	return newTempDiskpackedWithIndex(t, 0, jsonconfig.Obj{})
 }
 
 func newTempDiskpackedMemory(t *testing.T) (sto blobserver.Storage, cleanup func()) {
-	return newTempDiskpackedWithIndex(t, jsonconfig.Obj{
+	return newTempDiskpackedWithIndex(t, 0, jsonconfig.Obj{
 		"type": "memory",
 	})
 }
 
-func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) (sto blobserver.Storage, cleanup func()) {
+func newTempDiskpackedWithIndex(t *testing.T, syncPeriod time.Duration, indexConf jsonconfig.Obj) (sto blobserver.Storage, cleanup func()) {
 	dir, err := ioutil.TempDir("", "diskpacked-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("diskpacked test dir is %q", dir)
-	s, err := newStorage(dir, 1<<20, indexConf)
+	s, err := newStorage(dir, 1<<20, syncPeriod, indexConf)
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
@@ -73,6 +74,8 @@ func TestDoubleReceive(t *testing.T) {
 	sto, cleanup := newTempDiskpacked(t)
 	defer cleanup()
 
+	t.Logf("sto=%#v", sto)
+
 	size := func(n int) int64 {
 		path := sto.(*storage).filename(n)
 		fi, err := os.Stat(path)
@@ -93,7 +96,9 @@ func TestDoubleReceive(t *testing.T) {
 	if size(0) < blobSize {
 		t.Fatalf("size = %d; want at least %d", size(0), blobSize)
 	}
-	sto.(*storage).nextPack()
+	if err := sto.(*storage).nextPack(); err != nil {
+		t.Fatalf("nextPack: %v", err)
+	}
 
 	_, err = blobserver.Receive(sto, br, b.Reader())
 	if err != nil {
@@ -193,6 +198,59 @@ func TestDelete(t *testing.T) {
 			if err := s(); err != nil {
 				t.Errorf("error at test %d, step %d: %v", i+1, j+1, err)
 			}
+		}
+	}
+}
+
+func newTempDiskpackedPeriodicSync(t *testing.T) (sto blobserver.Storage, cleanup func()) {
+	return newTempDiskpackedWithIndex(t, defaultSyncPeriod, jsonconfig.Obj{})
+}
+
+func TestPeriodicSync(t *testing.T) {
+	storagetest.Test(t, newTempDiskpackedPeriodicSync)
+
+	sto, cleanup := newTempDiskpackedPeriodicSync(t)
+	defer cleanup()
+
+	add := func(tb *test.Blob) error {
+		sb, err := sto.ReceiveBlob(tb.BlobRef(), tb.Reader())
+		if err != nil {
+			return fmt.Errorf("ReceiveBlob of %s: %v", sb, err)
+		}
+		if sb != tb.SizedRef() {
+			return fmt.Errorf("Received %v; want %v", sb, tb.SizedRef())
+		}
+		return nil
+	}
+
+	s := sto.(*storage)
+
+	for _, tb := range []*test.Blob{
+		&test.Blob{Contents: "some small blob"},
+		&test.Blob{Contents: strings.Repeat("some middle blob", 100)},
+		&test.Blob{Contents: strings.Repeat("A 8192 bytes length largish blob", 8192/32)},
+	} {
+		ofi, err := s.writer.Stat()
+		if err != nil {
+			t.Error(err)
+			break
+		}
+
+		if err = add(tb); err != nil {
+			t.Error(err)
+			break
+		}
+		time.Sleep(2 * defaultSyncPeriod)
+
+		nfi, err := s.writer.Stat()
+		if err != nil {
+			t.Error(err)
+		}
+		if nfi.Name() != ofi.Name() {
+			continue
+		}
+		if nfi.Size() <= ofi.Size() {
+			t.Errorf("Size of %s hasn't grew after add and wait a syncPeriod! (before=%d, after=%d)", ofi.Name(), ofi.Size(), nfi.Size())
 		}
 	}
 }

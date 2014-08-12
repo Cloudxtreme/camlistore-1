@@ -44,6 +44,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
@@ -76,6 +77,8 @@ func (d debugT) Println(args ...interface{}) {
 
 const defaultMaxFileSize = 512 << 20 // 512MB
 
+const defaultSyncPeriod = 1 * time.Second
+
 type storage struct {
 	root        string
 	index       sorted.KeyValue
@@ -83,13 +86,24 @@ type storage struct {
 
 	writeLock io.Closer // Provided by lock.Lock, and guards other processes from accesing the file open for writes.
 
-	mu     sync.Mutex // Guards all I/O state.
-	closed bool
-	writer *os.File
-	fds    []*os.File
-	size   int64
+	mu         sync.Mutex // Guards all I/O state.
+	closed     bool
+	writer     fileLike
+	fds        []*os.File
+	size       int64
+	syncTicker *time.Ticker
 
 	*local.Generationer
+}
+
+type fileLike interface {
+	Name() string
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+	Sync() error
+	Seek(p int64, t int) (int64, error)
+	Stat() (os.FileInfo, error)
+	Close() error
 }
 
 func (s *storage) String() string {
@@ -124,12 +138,15 @@ func New(dir string) (blobserver.Storage, error) {
 		// TODO: detect existing max size from size of files, if obvious,
 		// and set maxSize to that?
 	}
-	return newStorage(dir, maxSize, nil)
+	return newStorage(dir, maxSize, defaultSyncPeriod, nil)
 }
 
 // newStorage returns a new storage in path root with the given maxFileSize,
-// or defaultMaxFileSize (512MB) if <= 0
-func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *storage, err error) {
+// or defaultMaxFileSize (512MB) if <= 0.
+// If syncPeriod is not zero, then a goroutine will call Sync periodically,
+// not after each write.
+// If syncPeriod is less than zero, then the defaultSyncPeriod (1s) will be used.
+func newStorage(root string, maxFileSize int64, syncPeriod time.Duration, indexConf jsonconfig.Obj) (s *storage, err error) {
 	fi, err := os.Stat(root)
 	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("storage root %q doesn't exist", root)
@@ -167,6 +184,13 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 		maxFileSize:  maxFileSize,
 		Generationer: local.NewGenerationer(root),
 	}
+	if syncPeriod < 0 {
+		syncPeriod = defaultSyncPeriod
+	}
+	if syncPeriod > 0 {
+		s.syncTicker = time.NewTicker(syncPeriod)
+		go periodicSync(s)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.openAllPacks(); err != nil {
@@ -180,14 +204,15 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 
 func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserver.Storage, err error) {
 	var (
-		path        = config.RequiredString("path")
-		maxFileSize = config.OptionalInt("maxFileSize", 0)
-		indexConf   = config.OptionalObject("metaIndex")
+		path              = config.RequiredString("path")
+		maxFileSize       = config.OptionalInt("maxFileSize", 0)
+		syncPeriodSeconds = config.OptionalInt("syncPeriodSeconds", 0)
+		indexConf         = config.OptionalObject("metaIndex")
 	)
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	return newStorage(path, int64(maxFileSize), indexConf)
+	return newStorage(path, int64(maxFileSize), time.Duration(syncPeriodSeconds)/time.Second, indexConf)
 }
 
 func init() {
@@ -218,15 +243,19 @@ func (s *storage) openForRead(n int) error {
 // appending new data.
 // This function is not thread safe, s.mu should be locked by the caller.
 func (s *storage) openForWrite(n int) error {
+	if err := s.closeWriter(); err != nil {
+		return fmt.Errorf("openForWrite(%d): %v", n, err)
+	}
+
 	fn := s.filename(n)
 	l, err := lock.Lock(fn + ".lock")
 	if err != nil {
-		return err
+		return fmt.Errorf("lock %s.lock: %v", fn, err)
 	}
 	f, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		l.Close()
-		return err
+		return fmt.Errorf("open %s: %v", fn, err)
 	}
 	openFdsVar.Add(s.root, 1)
 	debug.Printf("diskpacked: opened for write %q", fn)
@@ -236,7 +265,11 @@ func (s *storage) openForWrite(n int) error {
 		return err
 	}
 
-	s.writer = f
+	if s.syncTicker != nil {
+		s.writer = &lazySync{File: f}
+	} else {
+		s.writer = f
+	}
 	s.writeLock = l
 	return nil
 }
@@ -256,15 +289,15 @@ func (s *storage) nextPack() error {
 		s.writeLock = nil
 	}
 	if s.writer != nil {
-		if err := s.writer.Close(); err != nil {
-			return err
+		if err := s.closeWriter(); err != nil {
+			return fmt.Errorf("nextPack(): %v", err)
 		}
 		openFdsVar.Add(s.root, -1)
 	}
 
 	n := len(s.fds)
 	if err := s.openForWrite(n); err != nil {
-		return err
+		return fmt.Errorf("nextPack: %v", err)
 	}
 	return s.openForRead(n)
 }
@@ -305,13 +338,13 @@ func (s *storage) Close() error {
 		if err := s.index.Close(); err != nil {
 			log.Println("diskpacked: closing index:", err)
 		}
+		closeErr = s.closeWriter()
 		for _, f := range s.fds {
-			if err := f.Close(); err != nil {
+			if err := f.Close(); err != nil && closeErr == nil {
 				closeErr = err
 			}
 			openFdsVar.Add(s.root, -1)
 		}
-		s.writer = nil
 		if l := s.writeLock; l != nil {
 			err := l.Close()
 			if closeErr == nil {
@@ -321,6 +354,15 @@ func (s *storage) Close() error {
 		}
 	}
 	return closeErr
+}
+
+func (s *storage) closeWriter() error {
+	w := s.writer
+	if w == nil {
+		return nil
+	}
+	s.writer = nil
+	return w.Close()
 }
 
 func (s *storage) Fetch(br blob.Ref) (io.ReadCloser, uint32, error) {
@@ -702,4 +744,64 @@ func (m blobMeta) String() string {
 
 func (m blobMeta) SizedRef(br blob.Ref) blob.SizedRef {
 	return blob.SizedRef{Ref: br, Size: m.size}
+}
+
+type lazySync struct {
+	mu sync.Mutex // protects change of dirty flag and the File
+	*os.File
+	dirty bool
+}
+
+func (ls *lazySync) Sync() error {
+	ls.mu.Lock()
+	ls.dirty = true
+	ls.mu.Unlock()
+	return nil
+}
+
+func (ls *lazySync) Close() error {
+	if ls.File == nil {
+		return nil
+	}
+	ls.mu.Lock()
+	err := ls.File.Close()
+	ls.mu.Unlock()
+	return err
+}
+
+// periodicSync calls Sync on the actual s.writer, for each
+// tick of s.syncTicker.
+func periodicSync(s *storage) {
+	for _ = range s.syncTicker.C {
+		s.mu.Lock()
+		closed := s.closed
+		w := s.writer
+		s.mu.Unlock()
+		if closed {
+			s.syncTicker.Stop()
+			return
+		}
+		ls, ok := w.(*lazySync)
+		if !ok {
+			return
+		}
+		if ls == nil {
+			continue
+		}
+		f := ls.File
+		if f == nil {
+			continue
+		}
+		ls.mu.Lock()
+		if !ls.dirty {
+			ls.mu.Unlock()
+			continue
+		}
+		func() {
+			defer ls.mu.Unlock()
+			if err := f.Sync(); err != nil {
+				log.Printf("Sync: %v", err)
+			}
+		}()
+	}
 }
