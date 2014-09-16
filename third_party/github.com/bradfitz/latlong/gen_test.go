@@ -38,8 +38,8 @@ import (
 	"testing"
 	"time"
 
-	"code.google.com/p/freetype-go/freetype/raster"
-	"github.com/jonas-p/go-shp"
+	"camlistore.org/third_party/code.google.com/p/freetype-go/freetype/raster"
+	"camlistore.org/third_party/github.com/jonas-p/go-shp"
 )
 
 var (
