@@ -1,5 +1,5 @@
 /*
-Copyright 2013 The Camlistore Authors.
+Copyright 2014 The Camlistore Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,31 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package kvfile provides an implementation of sorted.KeyValue
+// Package leveldb provides an implementation of sorted.KeyValue
 // on top of a single mutable database file on disk using
-// github.com/cznic/kv.
-package kvfile
+// github.com/syndtr/goleveldb.
+package leveldb
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"sync"
 
 	"camlistore.org/pkg/jsonconfig"
-	"camlistore.org/pkg/kvutil"
 	"camlistore.org/pkg/sorted"
 
-	"camlistore.org/third_party/github.com/cznic/kv"
+	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb"
+	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/filter"
+	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/iterator"
+	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/opt"
+	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/util"
 )
 
 var _ sorted.Wiper = (*kvis)(nil)
 
 func init() {
-	sorted.RegisterKeyValue("kv", newKeyValueFromJSONConfig)
+	sorted.RegisterKeyValue("leveldb", newKeyValueFromJSONConfig)
 }
 
 // NewStorage is a convenience that calls newKeyValueFromJSONConfig
@@ -48,41 +48,47 @@ func NewStorage(file string) (sorted.KeyValue, error) {
 }
 
 // newKeyValueFromJSONConfig returns a KeyValue implementation on top of a
-// github.com/cznic/kv file.
+// github.com/syndtr/goleveldb/leveldb file.
 func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 	file := cfg.RequiredString("file")
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	opts := &kv.Options{}
-	db, err := kvutil.Open(file, opts)
+	opts := &opt.Options{
+		CachedOpenFiles: 128,
+		Filter:          filter.NewBloomFilter(8),
+		Strict:          opt.DefaultStrict,
+	}
+	db, err := leveldb.OpenFile(file, opts)
 	if err != nil {
 		return nil, err
 	}
 	is := &kvis{
-		db:   db,
-		opts: opts,
-		path: file,
+		db:       db,
+		path:     file,
+		opts:     opts,
+		readOpts: &opt.ReadOptions{Strict: opt.DefaultStrict},
+		// TODO(tgulacsi): decide whether a Sync:true leveldb.WriteOption is needed, or not.
+		writeOpts: &opt.WriteOptions{Sync: true},
 	}
 	return is, nil
 }
 
 type kvis struct {
-	path string
-	db   *kv.DB
-	opts *kv.Options
-	txmu sync.Mutex
+	path      string
+	db        *leveldb.DB
+	opts      *opt.Options
+	readOpts  *opt.ReadOptions
+	writeOpts *opt.WriteOptions
+	txmu      sync.Mutex
 }
 
-// TODO: use bytepool package.
-func getBuf(n int) []byte { return make([]byte, n) }
-func putBuf([]byte)       {}
-
 func (is *kvis) Get(key string) (string, error) {
-	buf := getBuf(200)
-	defer putBuf(buf)
-	val, err := is.db.Get(buf, []byte(key))
+	val, err := is.db.Get([]byte(key), is.readOpts)
 	if err != nil {
+		if err == leveldb.ErrNotFound {
+			return "", sorted.ErrNotFound
+		}
 		return "", err
 	}
 	if val == nil {
@@ -92,25 +98,30 @@ func (is *kvis) Get(key string) (string, error) {
 }
 
 func (is *kvis) Set(key, value string) error {
-	return is.db.Set([]byte(key), []byte(value))
+	return is.db.Put([]byte(key), []byte(value), is.writeOpts)
 }
 
 func (is *kvis) Delete(key string) error {
-	return is.db.Delete([]byte(key))
+	return is.db.Delete([]byte(key), is.writeOpts)
 }
 
 func (is *kvis) Find(start, end string) sorted.Iterator {
-	it := &iter{
-		db:       is.db,
-		startKey: start,
-		endKey:   []byte(end),
+	var startB, endB []byte
+	// A nil Range.Start is treated as a key before all keys in the DB..
+	if start != "" {
+		startB = []byte(start)
 	}
-	it.enum, _, it.err = it.db.Seek([]byte(start))
+	// A nil Range.Limit is treated as a key after all keys in the DB.
+	if end != "" {
+		endB = []byte(end)
+	}
+	it := &iter{
+		it: is.db.NewIterator(
+			&util.Range{Start: startB, Limit: endB},
+			is.readOpts,
+		),
+	}
 	return it
-}
-
-func (is *kvis) BeginBatch() sorted.BatchMutation {
-	return sorted.NewBatchMutation()
 }
 
 func (is *kvis) Wipe() error {
@@ -118,11 +129,11 @@ func (is *kvis) Wipe() error {
 	if err := is.db.Close(); err != nil {
 		return err
 	}
-	if err := os.Remove(is.path); err != nil {
+	if err := os.RemoveAll(is.path); err != nil {
 		return err
 	}
 
-	db, err := kv.Create(is.path, is.opts)
+	db, err := leveldb.OpenFile(is.path, is.opts)
 	if err != nil {
 		return fmt.Errorf("error creating %s: %v", is.path, err)
 	}
@@ -130,57 +141,37 @@ func (is *kvis) Wipe() error {
 	return nil
 }
 
-type batch interface {
-	Mutations() []sorted.Mutation
+func (is *kvis) BeginBatch() sorted.BatchMutation {
+	return &lvbatch{batch: new(leveldb.Batch)}
+}
+
+type lvbatch struct {
+	batch *leveldb.Batch
+}
+
+func (lvb *lvbatch) Set(key, value string) {
+	lvb.batch.Put([]byte(key), []byte(value))
+}
+
+func (lvb *lvbatch) Delete(key string) {
+	lvb.batch.Delete([]byte(key))
 }
 
 func (is *kvis) CommitBatch(bm sorted.BatchMutation) error {
-	b, ok := bm.(batch)
+	b, ok := bm.(*lvbatch)
 	if !ok {
 		return errors.New("invalid batch type")
 	}
-	is.txmu.Lock()
-	defer is.txmu.Unlock()
-
-	good := false
-	defer func() {
-		if !good {
-			is.db.Rollback()
-		}
-	}()
-
-	if err := is.db.BeginTransaction(); err != nil {
-		return err
-	}
-	for _, m := range b.Mutations() {
-		if m.IsDelete() {
-			if err := is.db.Delete([]byte(m.Key())); err != nil {
-				return err
-			}
-		} else {
-			if err := is.db.Set([]byte(m.Key()), []byte(m.Value())); err != nil {
-				return err
-			}
-		}
-	}
-
-	good = true
-	return is.db.Commit()
+	return is.db.Write(b.batch, is.writeOpts)
 }
 
 func (is *kvis) Close() error {
-	log.Printf("Closing kvfile database %s", is.path)
 	return is.db.Close()
 }
 
 type iter struct {
-	db       *kv.DB
-	startKey string
-	endKey   []byte
+	it iterator.Iterator
 
-	enum *kv.Enumerator
-
-	valid      bool
 	key, val   []byte
 	skey, sval *string // non-nil if valid
 
@@ -190,74 +181,43 @@ type iter struct {
 
 func (it *iter) Close() error {
 	it.closed = true
-	return it.err
+	it.it.Release()
+	return nil
 }
 
 func (it *iter) KeyBytes() []byte {
-	if !it.valid {
-		panic("not valid")
-	}
-	return it.key
+	return it.it.Key()
 }
 
 func (it *iter) Key() string {
-	if !it.valid {
-		panic("not valid")
-	}
 	if it.skey != nil {
 		return *it.skey
 	}
-	str := string(it.key)
+	str := string(it.it.Key())
 	it.skey = &str
 	return str
 }
 
 func (it *iter) ValueBytes() []byte {
-	if !it.valid {
-		panic("not valid")
-	}
-	return it.val
+	return it.it.Value()
 }
 
 func (it *iter) Value() string {
-	if !it.valid {
-		panic("not valid")
-	}
 	if it.sval != nil {
 		return *it.sval
 	}
-	str := string(it.val)
+	str := string(it.it.Value())
 	it.sval = &str
 	return str
 }
 
-func (it *iter) end() bool {
-	it.valid = false
-	it.closed = true
-	return false
-}
-
 func (it *iter) Next() bool {
-	if it.err != nil {
+	if err := it.it.Error(); err != nil {
 		return false
 	}
 	if it.closed {
 		panic("Next called after Next returned value")
 	}
 	it.skey, it.sval = nil, nil
-	var err error
-	it.key, it.val, err = it.enum.Next()
-	if err == io.EOF {
-		it.err = nil
-		return it.end()
-	}
-	if err != nil {
-		it.err = err
-		return it.end()
-	}
-	if len(it.endKey) > 0 && bytes.Compare(it.key, it.endKey) >= 0 {
-		return it.end()
-	}
-	it.valid = true
-	return true
+	return it.it.Next()
 }
