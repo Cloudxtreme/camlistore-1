@@ -425,7 +425,7 @@ func TestSmallFallback(t *testing.T) {
 		saw = true
 		return nil
 	}); err != nil {
-		t.Errorf("EnuerateAll: %v", err)
+		t.Errorf("EnumerateAll: %v", err)
 	}
 	if !saw {
 		t.Error("didn't see blob in Enumerate")
@@ -446,10 +446,13 @@ func TestZ_LeakCheck(t *testing.T) {
 }
 
 func TestStreamBlobs(t *testing.T) {
-	small := new(test.Fetcher)
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	small, large := new(test.Fetcher), new(test.Fetcher)
 	s := &storage{
 		small: small,
-		large: new(test.Fetcher),
+		large: large,
 		meta:  sorted.NewMemoryKeyValue(),
 		log:   test.NewLogger(t, "blobpacked: "),
 	}
@@ -461,29 +464,78 @@ func TestStreamBlobs(t *testing.T) {
 		b.MustUpload(t, small)
 		all[b.BlobRef()] = true
 	}
+
+	const fileSize = 17 << 20 // more than 16 MB, so more than one zip
+	const fileName = "foo.dat"
+	fileContents := randBytes(fileSize)
+
+	br, err := schema.WriteFileFromReader(s, fileName, bytes.NewReader(fileContents))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all[br] = true
+	t.Logf("items in small: %v", small.NumBlobs())
+	t.Logf("items in large: %v", large.NumBlobs())
+
 	ctx := context.New()
 	defer ctx.Cancel()
 	token := "" // beginning
 
 	got := map[blob.Ref]bool{}
-	dest := make(chan *blob.Blob, 16)
-	done := make(chan bool)
-	go func() {
-		defer close(done)
-		for b := range dest {
-			got[b.Ref()] = true
-		}
-	}()
+	prepare := func(await int) (chan *blob.Blob, <-chan bool) {
+		dest := make(chan *blob.Blob, 16)
+		done := make(chan bool)
+		go func() {
+			defer close(done)
+			var n int
+			for b := range dest {
+				t.Logf("got %s", b.Ref())
+				if _, ok := got[b.Ref()]; ok {
+					t.Errorf("blob %v already got!", b.Ref())
+				}
+				got[b.Ref()] = true
+				n++
+				if await > 0 && n == await {
+					ctx.Cancel()
+					break
+				}
+			}
+		}()
+		return dest, done
+	}
+	// FIXME(tgulacsi): if 1 await only 10, then I'll get zero large blobs!
+	dest, done := prepare(0)
 	nextToken, err := s.StreamBlobs(ctx, dest, token, 1<<63-1)
-	if err != nil {
+	if err != nil && err != context.ErrCanceled {
 		t.Fatalf("StreamBlobs = %v", err)
 	}
 	if nextToken != "l:" {
 		t.Fatalf("nextToken = %q; want \"l:\"", nextToken)
 	}
 	<-done
-	if !reflect.DeepEqual(got, all) {
-		t.Errorf("Got blobs %v; want %v", got, all)
+	sn := len(got)
+	t.Logf("got %d small blobs", sn)
+	if sn != 10 {
+		t.Errorf("Awaited %d small blobs, got %d.", sn, 10)
+	}
+
+	// FIXME(tgulacsi): if I don't limit the large blobs, then I get 57!
+	dest, done = prepare(1)
+	nextToken, err = s.StreamBlobs(ctx, dest, "l:", 1<<63-1)
+	if err != nil && err != context.ErrCanceled {
+		t.Fatalf("StreamBlobs(%q) = %v", nextToken, err)
+	}
+	if nextToken != "" {
+		t.Fatal("nextToken is not empty!")
+	}
+	<-done
+	t.Logf("got %d large blobs", len(got)-sn)
+	if len(got)-sn != 1 {
+		t.Errorf("Awaited %d large blobs, got %d.", 1, len(got)-sn)
+	}
+
+	if len(got) != len(all) || !reflect.DeepEqual(got, all) {
+		t.Errorf("Got %d blobs: %v\nwant %d: %v", len(got), got, len(all), all)
 	}
 }
 

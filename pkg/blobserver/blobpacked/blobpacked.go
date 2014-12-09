@@ -78,7 +78,6 @@ file will have a different 'wholePartIndex' number, starting at index
 
 package blobpacked
 
-// TODO: BlobStreamer using the zip manifests, for recovery.
 // TODO: be a SubFetcher ourselves?
 
 import (
@@ -958,6 +957,85 @@ func (s *storage) foreachZipBlob(zipRef blob.Ref, fn func(BlobAndPos) error) err
 	for _, bap := range mf.DataBlobs {
 		bap.Offset += firstOff
 		if err := fn(bap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// foreachZipBlobReader calls fn for each blob in the zip pack blob
+// identified by zipRef.  If fn returns a non-nil error,
+// foreachZipBlob stops enumerating with that error.
+func (s *storage) foreachZipBlobReader(zr *zip.Reader, fn func(BlobAndPos, *zip.File) error) error {
+	var (
+		maniFile *zip.File // or nil if not found
+		firstOff int64     // offset of first file (the packed data chunks)
+		err      error
+	)
+	for i, f := range zr.File {
+		if i == 0 {
+			firstOff, err = f.DataOffset()
+			if err != nil {
+				return err
+			}
+		}
+		if f.Name == zipManifestPath {
+			maniFile = f
+			break
+		}
+	}
+	if maniFile == nil {
+		return errors.New("no camlistore manifest file found in zip")
+	}
+	maniRC, err := maniFile.Open()
+	if err != nil {
+		return err
+	}
+	defer maniRC.Close()
+	var mf Manifest
+	if err := json.NewDecoder(maniRC).Decode(&mf); err != nil {
+		return err
+	}
+	if !mf.WholeRef.Valid() || mf.WholeSize == 0 || !mf.DataBlobsOrigin.Valid() {
+		return errors.New("incomplete blobpack manifest JSON")
+	}
+	if len(mf.DataBlobs) == 0 {
+		s.log.Printf("empty manifest (no data blobs)!")
+	}
+	m := make(map[blob.Ref]int, len(mf.DataBlobs))
+	for i, bap := range mf.DataBlobs {
+		bap.Offset += firstOff
+		m[bap.SizedRef.Ref] = i
+	}
+	for _, f := range zr.File {
+		if !strings.HasPrefix(f.Name, "camlistore/") || f.Name == zipManifestPath ||
+			!strings.HasSuffix(f.Name, ".json") {
+			continue
+		}
+		brStr := strings.TrimSuffix(strings.TrimPrefix(f.Name, "camlistore/"), ".json")
+		br, ok := blob.Parse(brStr)
+		if !ok {
+			continue
+		}
+		off, err := f.DataOffset()
+		if err != nil {
+			return err
+		}
+		bapZ := BlobAndPos{
+			SizedRef: blob.SizedRef{br, uint32(f.UncompressedSize64)},
+			Offset:   off,
+		}
+		// FIXME(tgulacsi): why do we have manifest if don't check it?
+		i, ok := m[br]
+		if !ok {
+			s.log.Printf("zip item %s is not in manifest!", f.Name)
+		} else {
+			bapM := mf.DataBlobs[i]
+			if bapZ.Offset != bapM.Offset {
+				s.log.Printf("zip item %s manifest offset=%d != %d=real offset", bapM.Offset, bapZ.Offset)
+			}
+		}
+		if err := fn(bapZ, f); err != nil {
 			return err
 		}
 	}
