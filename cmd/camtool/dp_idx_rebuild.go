@@ -28,6 +28,11 @@ import (
 	"camlistore.org/pkg/jsonconfig"
 	"camlistore.org/pkg/osutil"
 	"camlistore.org/pkg/serverinit"
+
+	// possible sorted.KeyValue implementations
+	_ "camlistore.org/pkg/sorted/boltdb"
+	_ "camlistore.org/pkg/sorted/kvfile"
+	_ "camlistore.org/pkg/sorted/leveldb"
 )
 
 type reindexdpCmd struct {

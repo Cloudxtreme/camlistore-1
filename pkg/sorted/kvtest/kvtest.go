@@ -19,6 +19,7 @@ package kvtest
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 
 	"camlistore.org/pkg/sorted"
@@ -72,7 +73,22 @@ func TestSorted(t *testing.T, kv sorted.KeyValue) {
 	set("y", "x:foo")
 	testEnumerate(t, kv, "x:", "x~")
 
-	// TODO: test batch commits
+	// test batch commits
+	b := kv.BeginBatch()
+	b.Set("batch:a", "batch:av")
+	b.Set("batch:b", "batch:bv")
+	testEnumerate(t, kv, "batch:", "batch~")
+	var wg sync.WaitGroup
+	// test commiting in a different goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := kv.CommitBatch(b); err != nil {
+			t.Errorf("batch commit: %v", err)
+		}
+	}()
+	wg.Wait()
+	testEnumerate(t, kv, "batch:", "batch~", "batch:av", "batch:bv")
 }
 
 func testEnumerate(t *testing.T, kv sorted.KeyValue, start, end string, want ...string) {

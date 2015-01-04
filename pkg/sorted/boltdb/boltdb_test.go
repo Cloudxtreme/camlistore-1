@@ -1,0 +1,46 @@
+/*
+Copyright 2014 The Camlistore Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package boltdb
+
+import (
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"camlistore.org/pkg/jsonconfig"
+	"camlistore.org/pkg/sorted"
+	"camlistore.org/pkg/sorted/kvtest"
+)
+
+func TestBoltdbKV(t *testing.T) {
+	tmpDir, err := ioutil.TempDir("", "camlistore-boltdbkv_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	dbname := filepath.Join(tmpDir, "testdb.boltdb")
+	t.Logf("Testing boltdb %q.", dbname)
+	kv, err := sorted.NewKeyValue(jsonconfig.Obj{
+		"type": "boltdb",
+		"file": dbname,
+	})
+	if err != nil {
+		t.Fatalf("Could not create boltdb sorted kv at %v: %v", dbname, err)
+	}
+	kvtest.TestSorted(t, kv)
+}

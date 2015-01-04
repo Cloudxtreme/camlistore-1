@@ -63,6 +63,7 @@ import (
 	// Indexers: (also present themselves as storage targets)
 	"camlistore.org/pkg/index"
 	// KeyValue implementations:
+	_ "camlistore.org/pkg/sorted/boltdb"
 	_ "camlistore.org/pkg/sorted/kvfile"
 	_ "camlistore.org/pkg/sorted/leveldb"
 	_ "camlistore.org/pkg/sorted/mongo"

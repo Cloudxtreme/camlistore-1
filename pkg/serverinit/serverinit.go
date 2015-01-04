@@ -504,7 +504,9 @@ func (config *Config) checkValidAuth() error {
 func (config *Config) InstallHandlers(hi HandlerInstaller, baseURL string, reindex bool, context *http.Request) (shutdown io.Closer, err error) {
 	defer func() {
 		if e := recover(); e != nil {
-			log.Printf("Caught panic installer handlers: %v", e)
+			buf := make([]byte, 1024)
+			buf = buf[:runtime.Stack(buf, false)]
+			log.Printf("Caught panic installer handlers: %v\n%s", e, buf)
 			err = fmt.Errorf("Caught panic: %v", e)
 		}
 	}()

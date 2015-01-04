@@ -296,6 +296,12 @@ func (b *lowBuilder) sortedStorage(sortedType string) (map[string]interface{}, e
 			"file": b.high.LevelDB,
 		}, nil
 	}
+	if b.high.BoltDB != "" {
+		return map[string]interface{}{
+			"type": "boltdb",
+			"file": b.high.BoltDB,
+		}, nil
+	}
 	if b.high.MemoryIndex {
 		return map[string]interface{}{
 			"type": "memory",
@@ -651,13 +657,13 @@ func (b *lowBuilder) build() (*Config, error) {
 	low["https"] = conf.HTTPS
 	low["auth"] = conf.Auth
 
-	numIndexers := numSet(conf.LevelDB, conf.Mongo, conf.MySQL, conf.PostgreSQL, conf.SQLite, conf.KVFile, conf.MemoryIndex)
+	numIndexers := numSet(conf.LevelDB, conf.BoltDB, conf.Mongo, conf.MySQL, conf.PostgreSQL, conf.SQLite, conf.KVFile, conf.MemoryIndex)
 
 	switch {
 	case b.runIndex() && numIndexers == 0:
-		return nil, fmt.Errorf("Unless runIndex is set to false, you must specify an index option (kvIndexFile, leveldb, mongo, mysql, postgres, sqlite, memoryIndex).")
+		return nil, fmt.Errorf("Unless runIndex is set to false, you must specify an index option (kvIndexFile, leveldb, boltdb, mongo, mysql, postgres, sqlite, memoryIndex).")
 	case b.runIndex() && numIndexers != 1:
-		return nil, fmt.Errorf("With runIndex set true, you can only pick exactly one indexer (mongo, mysql, postgres, sqlite, kvIndexFile, leveldb, memoryIndex).")
+		return nil, fmt.Errorf("With runIndex set true, you can only pick exactly one indexer (mongo, mysql, postgres, sqlite, kvIndexFile, leveldb, boltdb, memoryIndex).")
 	case !b.runIndex() && numIndexers != 0:
 		return nil, fmt.Errorf("With runIndex disabled, you can't specify any of mongo, mysql, postgres, sqlite.")
 	}
