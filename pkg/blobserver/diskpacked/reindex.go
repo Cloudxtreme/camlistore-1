@@ -85,14 +85,14 @@ func (s *storage) reindexOne(ctx *context.Context, index sorted.KeyValue, overwr
 	verbose := camliDebug
 	misses := make(map[blob.Ref]string, 8)
 	err := s.walkPack(verbose, packID,
-		func(packID int, ref blob.Ref, offset int64, size uint32) error {
+		func(packID int, ref blob.Ref, offset int64, realSize, onDiskSize uint32) error {
 			if !ref.Valid() {
 				if camliDebug {
-					log.Printf("found deleted blob in %d at %d with size %d", packID, offset, size)
+					log.Printf("found deleted blob in %d at %d with size %d/%d", packID, offset, realSize, onDiskSize)
 				}
 				return nil
 			}
-			meta := blobMeta{packID, offset, size}.String()
+			meta := blobMeta{packID, offset, realSize, onDiskSize}.String()
 			if overwrite && batch != nil {
 				batch.Set(ref.String(), meta)
 				return nil
@@ -140,7 +140,8 @@ func (s *storage) reindexOne(ctx *context.Context, index sorted.KeyValue, overwr
 // Walk walks the storage and calls the walker callback with each blobref
 // stops if walker returns non-nil error, and returns that
 func (s *storage) Walk(ctx *context.Context,
-	walker func(packID int, ref blob.Ref, offset int64, size uint32) error) error {
+	walker func(packID int, ref blob.Ref, offset int64, realSize, onDiskSize uint32) error,
+) error {
 
 	// TODO(tgulacsi): proper verbose flag from context
 	verbose := camliDebug
@@ -164,7 +165,8 @@ func (s *storage) Walk(ctx *context.Context,
 // walkPack walks the given pack and calls the walker callback with each blobref.
 // Stops if walker returns non-nil error and returns that.
 func (s *storage) walkPack(verbose bool, packID int,
-	walker func(packID int, ref blob.Ref, offset int64, size uint32) error) error {
+	walker func(packID int, ref blob.Ref, offset int64, realSize, onDiskSize uint32) error,
+) error {
 
 	fh, err := os.Open(s.filename(packID))
 	if err != nil {
@@ -174,9 +176,8 @@ func (s *storage) walkPack(verbose bool, packID int,
 	name := fh.Name()
 
 	var (
-		pos  int64
-		size uint32
-		ref  blob.Ref
+		pos, realSize int64
+		ref           blob.Ref
 	)
 
 	errAt := func(prefix, suffix string) error {
@@ -216,13 +217,13 @@ func (s *storage) walkPack(verbose bool, packID int,
 		if err != nil {
 			return errAt(fmt.Sprintf("cannot parse size %q as int", chunk[i+1:]), err.Error())
 		}
-		size = uint32(size64)
 
 		if deletedBlobRef.Match(chunk[:i]) {
 			ref = blob.Ref{}
 			if verbose {
 				log.Printf("found deleted at %d", pos)
 			}
+			realSize = int64(size64)
 		} else {
 			var ok bool
 			ref, ok = blob.Parse(string(chunk[:i]))
@@ -232,15 +233,20 @@ func (s *storage) walkPack(verbose bool, packID int,
 			if verbose {
 				log.Printf("found %s at %d", ref, pos)
 			}
+			// TODO(tgulacsi): not just seek, but check the hashes of the files
+			// maybe with a different command-line flag, only.
+			if realSize, err = io.Copy(ioutil.Discard,
+				NewDecompressor(&io.LimitedReader{R: br, N: int64(size64)}),
+			); err != nil {
+				return err
+			}
 		}
-		if err = walker(packID, ref, pos+1+int64(m), size); err != nil {
+		if err = walker(packID, ref, pos+1+int64(m), uint32(realSize), uint32(size64)); err != nil {
 			return err
 		}
 
 		pos += 1 + int64(m)
-		// TODO(tgulacsi): not just seek, but check the hashes of the files
-		// maybe with a different command-line flag, only.
-		if pos, err = fh.Seek(pos+int64(size), 0); err != nil {
+		if pos, err = fh.Seek(pos+int64(size64), 0); err != nil {
 			return errAt("", "cannot seek +"+strconv.FormatUint(size64, 10)+" bytes")
 		}
 		// drain the buffer after the underlying reader Seeks

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"strings"
 	"testing"
@@ -73,6 +74,16 @@ func TestDiskpackedAltIndex(t *testing.T) {
 	storagetest.Test(t, newTempDiskpackedMemory)
 }
 
+var abc = []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+func randBytes(dst []byte, length int) []byte {
+	dst = dst[:0]
+	for i := 0; i < length; i++ {
+		dst = append(dst, abc[rand.Intn(64)])
+	}
+	return dst
+}
+
 func TestDoubleReceive(t *testing.T) {
 	sto, cleanup := newTempDiskpacked(t)
 	defer cleanup()
@@ -87,7 +98,7 @@ func TestDoubleReceive(t *testing.T) {
 	}
 
 	const blobSize = 5 << 10
-	b := &test.Blob{Contents: strings.Repeat("a", blobSize)}
+	b := &test.Blob{Contents: string(randBytes(nil, blobSize))}
 	br := b.BlobRef()
 
 	_, err := blobserver.Receive(sto, br, b.Reader())
@@ -219,7 +230,7 @@ func TestDoubleReceiveFailingIndex(t *testing.T) {
 	}
 
 	const blobSize = 5 << 10
-	b := &test.Blob{Contents: strings.Repeat("a", blobSize)}
+	b := &test.Blob{Contents: string(randBytes(nil, blobSize))}
 	br := b.BlobRef()
 
 	_, err := blobserver.Receive(sto, br, b.Reader())

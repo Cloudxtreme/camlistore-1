@@ -355,17 +355,18 @@ func (s *storage) fetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, si
 		return nil, 0, fmt.Errorf("diskpacked: attempt to fetch blob from out of range pack file %d > %d", meta.file, len(s.fds))
 	}
 	rac := s.fds[meta.file]
+	dcr := NewDecomprAt(io.NewSectionReader(rac, meta.offset, int64(meta.onDiskSize)))
 	var rs io.ReadSeeker
 	if length == -1 {
 		// normal Fetch mode
-		rs = io.NewSectionReader(rac, meta.offset, int64(meta.size))
+		rs = io.NewSectionReader(dcr, offset, int64(meta.realSize))
 	} else {
-		if offset > int64(meta.size) {
+		if offset > int64(meta.realSize) {
 			return nil, 0, errors.New("subfetch offset greater than blob size")
-		} else if offset+length > int64(meta.size) {
-			length = int64(meta.size) - offset
+		} else if offset+length > int64(meta.realSize) {
+			length = int64(meta.realSize) - offset
 		}
-		rs = io.NewSectionReader(rac, meta.offset+offset, length)
+		rs = io.NewSectionReader(dcr, offset, length)
 	}
 	fn := rac.Name()
 	// Ensure entry is in map.
@@ -384,7 +385,7 @@ func (s *storage) fetch(br blob.Ref, offset, length int64) (rc io.ReadCloser, si
 		rs,
 		types.NopCloser,
 	}
-	return rsc, meta.size, nil
+	return rsc, meta.realSize, nil
 }
 
 func (s *storage) filename(file int) string {
@@ -611,7 +612,7 @@ func (s *storage) StreamBlobs(ctx *context.Context, dest chan<- blobserver.BlobA
 		// to see if they have everything incur lots of garbage if they
 		// don't open any blobs.
 		data := make([]byte, size)
-		if _, err := io.ReadFull(r, data); err != nil {
+		if _, err := io.ReadFull(NewDecompressor(r), data); err != nil {
 			return err
 		}
 		offset += int64(size)
@@ -648,7 +649,7 @@ func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sbr blob.SizedRef,
 	// or truncated.
 	if m, err := s.meta(br); err == nil {
 		fi, err := os.Stat(s.filename(m.file))
-		if err == nil && fi.Size() >= m.offset+int64(m.size) {
+		if err == nil && fi.Size() >= m.offset+int64(m.onDiskSize) {
 			return sbr, nil
 		}
 	}
@@ -667,8 +668,13 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	// to be able to undo the append
 	origOffset := s.size
 
+	data, err := compressFromStream(r)
+	if err != nil {
+		return err
+	}
+	size := len(data)
 	fn := s.writer.Name()
-	n, err := fmt.Fprintf(s.writer, "[%v %v]", br.Ref.String(), br.Size)
+	n, err := fmt.Fprintf(s.writer, "[%v %v]", br.Ref.String(), size)
 	s.size += int64(n)
 	writeVar.Add(fn, int64(n))
 	writeTotVar.Add(s.root, int64(n))
@@ -687,15 +693,15 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	}
 	offset = s.size // make this a declaration once the above is removed
 
-	n2, err := io.Copy(s.writer, r)
-	s.size += n2
+	n2, err := s.writer.Write(data)
+	s.size += int64(n2)
 	writeVar.Add(fn, int64(n))
 	writeTotVar.Add(s.root, int64(n))
 	if err != nil {
 		return err
 	}
-	if n2 != int64(br.Size) {
-		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
+	if n2 != size {
+		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, size)
 	}
 	if err = s.writer.Sync(); err != nil {
 		return err
@@ -707,7 +713,7 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 			return err
 		}
 	}
-	err = s.index.Set(br.Ref.String(), blobMeta{packIdx, offset, br.Size}.String())
+	err = s.index.Set(br.Ref.String(), blobMeta{packIdx, offset, br.Size, uint32(size)}.String())
 	if err != nil {
 		if _, seekErr := s.writer.Seek(origOffset, os.SEEK_SET); seekErr != nil {
 			log.Printf("ERROR seeking back to the original offset: %v", seekErr)
@@ -738,20 +744,25 @@ func (s *storage) meta(br blob.Ref) (m blobMeta, err error) {
 
 // blobMeta is the blob metadata stored in the index.
 type blobMeta struct {
-	file   int
-	offset int64
-	size   uint32
+	file                 int
+	offset               int64
+	realSize, onDiskSize uint32
 }
 
 func parseBlobMeta(s string) (m blobMeta, ok bool) {
-	n, err := fmt.Sscan(s, &m.file, &m.offset, &m.size)
+	n, err := fmt.Sscan(s, &m.file, &m.offset, &m.realSize, &m.onDiskSize)
+	if err == nil {
+		return m, n == 4
+	}
+	n, err = fmt.Sscan(s, &m.file, &m.offset, &m.realSize)
+	m.onDiskSize = m.realSize
 	return m, n == 3 && err == nil
 }
 
 func (m blobMeta) String() string {
-	return fmt.Sprintf("%v %v %v", m.file, m.offset, m.size)
+	return fmt.Sprintf("%v %v %v %v", m.file, m.offset, m.realSize, m.onDiskSize)
 }
 
 func (m blobMeta) SizedRef(br blob.Ref) blob.SizedRef {
-	return blob.SizedRef{Ref: br, Size: m.size}
+	return blob.SizedRef{Ref: br, Size: m.realSize}
 }

@@ -44,7 +44,7 @@ func (s *storage) delete(br blob.Ref) error {
 	defer f.Close()
 
 	// walk back, find the header, and overwrite the hash with xxxx-000000...
-	k := 1 + len(br.String()) + 1 + len(strconv.FormatUint(uint64(meta.size), 10)) + 1
+	k := 1 + len(br.String()) + 1 + len(strconv.FormatUint(uint64(meta.onDiskSize), 10)) + 1
 	off := meta.offset - int64(k)
 	b := make([]byte, k)
 	if k, err = f.ReadAt(b, off); err != nil {
@@ -79,7 +79,7 @@ func (s *storage) delete(br blob.Ref) error {
 
 	// punch hole, if possible
 	if punchHole != nil {
-		err = punchHole(f, meta.offset, int64(meta.size))
+		err = punchHole(f, meta.offset, int64(meta.onDiskSize))
 		if err == nil {
 			return nil
 		}
@@ -97,7 +97,7 @@ func (s *storage) delete(br blob.Ref) error {
 	if n != meta.offset {
 		return fmt.Errorf("error seeking to %d: got %d", meta.offset, n)
 	}
-	_, err = io.CopyN(f, zeroReader{}, int64(meta.size))
+	_, err = io.CopyN(f, zeroReader{}, int64(meta.onDiskSize))
 	return err
 }
 
