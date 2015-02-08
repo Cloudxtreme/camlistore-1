@@ -24,6 +24,7 @@ import (
 	"log"
 	"os"
 
+	"camlistore.org/pkg/blobserver/blobpacked"
 	"camlistore.org/pkg/cmdmain"
 	"camlistore.org/pkg/search"
 )
@@ -62,7 +63,7 @@ func (c *packBlobsCmd) RunCommand(args []string) error {
 		Constraint: &search.Constraint{
 			File: &search.FileConstraint{
 				FileSize: &search.IntConstraint{
-					Min: 512 << 10,
+					Min: blobpacked.PackThreshold,
 				},
 			},
 		},

@@ -109,7 +109,7 @@ import (
 
 // TODO: evaluate whether this should even be 0, to keep the schema blobs together at least.
 // Files under this size aren't packed.
-const packThreshold = 512 << 10
+const PackThreshold = 512
 
 // Overhead for zip files.
 // These are only variables so they can be changed by tests, but
@@ -428,7 +428,7 @@ func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sb blob.SizedRef, 
 			return sb, err
 		}
 	}
-	if !isFile || meta.isPacked() || fileBlob.PartsSize() < packThreshold {
+	if !isFile || meta.isPacked() || fileBlob.PartsSize() < PackThreshold {
 		return sb, nil
 	}
 
