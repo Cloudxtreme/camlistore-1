@@ -22,6 +22,7 @@ package leveldb
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 
@@ -33,6 +34,7 @@ import (
 	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/filter"
 	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/iterator"
 	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/opt"
+	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/storage"
 	"camlistore.org/third_party/github.com/syndtr/goleveldb/leveldb/util"
 )
 
@@ -69,7 +71,18 @@ func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 		Filter: filter.NewBloomFilter(10),
 		Strict: strictness,
 	}
-	db, err := leveldb.OpenFile(file, opts)
+	var (
+		err error
+		sto storage.Storage
+	)
+	sto, err = storage.OpenFile(file)
+	if err != nil {
+		return nil, err
+	}
+	if os.Getenv("CAMLI_DEBUG") == "1" {
+		sto = loggingStorage{sto}
+	}
+	db, err := leveldb.Open(sto, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +97,10 @@ func newKeyValueFromJSONConfig(cfg jsonconfig.Obj) (sorted.KeyValue, error) {
 	}
 	return is, nil
 }
+
+type loggingStorage struct{ storage.Storage }
+
+func (sto loggingStorage) Log(txt string) { log.Println("[LDB] " + txt) }
 
 type kvis struct {
 	path      string
