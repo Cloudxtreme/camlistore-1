@@ -178,7 +178,7 @@ func isWriteFlags(flags fuse.OpenFlags) bool {
 }
 
 func (n *node) Open(req *fuse.OpenRequest, res *fuse.OpenResponse, intr fusefs.Intr) (fusefs.Handle, fuse.Error) {
-	log.Printf("CAMLI Open on %v: %#v", n.blobref, req)
+	Debug("CAMLI Open on %v: %#v", n.blobref, req)
 	if isWriteFlags(req.Flags) {
 		return nil, fuse.EPERM
 	}
@@ -205,7 +205,7 @@ type nodeReader struct {
 }
 
 func (nr *nodeReader) Read(req *fuse.ReadRequest, res *fuse.ReadResponse, intr fusefs.Intr) fuse.Error {
-	log.Printf("CAMLI nodeReader READ on %v: %#v", nr.n.blobref, req)
+	Debug("CAMLI nodeReader READ on %v: %#v", nr.n.blobref, req)
 	if req.Offset >= nr.fr.Size() {
 		return nil
 	}
@@ -227,13 +227,13 @@ func (nr *nodeReader) Read(req *fuse.ReadRequest, res *fuse.ReadResponse, intr f
 }
 
 func (nr *nodeReader) Release(req *fuse.ReleaseRequest, intr fusefs.Intr) fuse.Error {
-	log.Printf("CAMLI nodeReader RELEASE on %v", nr.n.blobref)
+	Debug("CAMLI nodeReader RELEASE on %v", nr.n.blobref)
 	nr.fr.Close()
 	return nil
 }
 
 func (n *node) ReadDir(intr fusefs.Intr) ([]fuse.Dirent, fuse.Error) {
-	log.Printf("CAMLI ReadDir on %v", n.blobref)
+	Debug("CAMLI ReadDir on %v", n.blobref)
 	n.dmu.Lock()
 	defer n.dmu.Unlock()
 	if n.dirents != nil {

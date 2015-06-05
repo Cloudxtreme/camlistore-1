@@ -55,6 +55,8 @@ const (
 	symlinkType
 )
 
+var Debug = func(fmt string, args ...interface{}) {}
+
 // mutDir is a mutable directory.
 // Its br is the permanode with camliPath:entname attributes.
 type mutDir struct {
@@ -266,7 +268,7 @@ func (n *mutDir) ReadDir(intr fs.Intr) ([]fuse.Dirent, fuse.Error) {
 			Name:  name,
 			Inode: ino,
 		}
-		log.Printf("mutDir(%q) appending inode %x, %+v", n.fullPath(), dirent.Inode, dirent)
+		Debug("mutDir(%q) appending inode %x, %+v", n.fullPath(), dirent.Inode, dirent)
 		ents = append(ents, dirent)
 	}
 	return ents, nil
@@ -274,7 +276,7 @@ func (n *mutDir) ReadDir(intr fs.Intr) ([]fuse.Dirent, fuse.Error) {
 
 func (n *mutDir) Lookup(name string, intr fs.Intr) (ret fs.Node, err fuse.Error) {
 	defer func() {
-		log.Printf("mutDir(%q).Lookup(%q) = %v, %v", n.fullPath(), name, ret, err)
+		Debug("mutDir(%q).Lookup(%q) = %v, %v", n.fullPath(), name, ret, err)
 	}()
 	if err := n.populate(); err != nil {
 		log.Println("populate:", err)
@@ -417,7 +419,7 @@ func (n *mutDir) creat(name string, typ nodeType) (fs.Node, error) {
 	n.children[name] = child
 	n.mu.Unlock()
 
-	log.Printf("Created %v in %p", child, n)
+	Debug("Created %v in %p", child, n)
 
 	return child, nil
 }
@@ -436,7 +438,7 @@ func (n *mutDir) Remove(req *fuse.RemoveRequest, intr fs.Intr) fuse.Error {
 		if removed, ok := n.children[req.Name]; ok {
 			removed.invalidate()
 			delete(n.children, req.Name)
-			log.Printf("Removed %v from %p", removed, n)
+			Debug("Removed %v from %p", removed, n)
 		}
 	}
 	n.mu.Unlock()
@@ -650,7 +652,7 @@ func (n *mutFile) setContent(br blob.Ref, size int64) error {
 func (n *mutFile) setSizeAtLeast(size int64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	log.Printf("mutFile.setSizeAtLeast(%d). old size = %d", size, n.size)
+	Debug("mutFile.setSizeAtLeast(%d). old size = %d", size, n.size)
 	if size > n.size {
 		n.size = size
 	}
@@ -668,7 +670,7 @@ func (n *mutFile) setSizeAtLeast(size int64) {
 func (n *mutFile) Open(req *fuse.OpenRequest, res *fuse.OpenResponse, intr fs.Intr) (fs.Handle, fuse.Error) {
 	mutFileOpen.Incr()
 
-	log.Printf("mutFile.Open: %v: content: %v dir=%v flags=%v", n.permanode, n.content, req.Dir, req.Flags)
+	Debug("mutFile.Open: %v: content: %v dir=%v flags=%v", n.permanode, n.content, req.Dir, req.Flags)
 	r, err := schema.NewFileReader(n.fs.fetcher, n.content)
 	if err != nil {
 		mutFileOpenError.Incr()
@@ -679,7 +681,7 @@ func (n *mutFile) Open(req *fuse.OpenRequest, res *fuse.OpenResponse, intr fs.In
 	// Read-only.
 	if !isWriteFlags(req.Flags) {
 		mutFileOpenRO.Incr()
-		log.Printf("mutFile.Open returning read-only file")
+		Debug("mutFile.Open returning read-only file")
 		n := &node{
 			fs:      n.fs,
 			blobref: n.content,
@@ -688,7 +690,7 @@ func (n *mutFile) Open(req *fuse.OpenRequest, res *fuse.OpenResponse, intr fs.In
 	}
 
 	mutFileOpenRW.Incr()
-	log.Printf("mutFile.Open returning read-write filehandle")
+	Debug("mutFile.Open returning read-write filehandle")
 
 	defer r.Close()
 	return n.newHandle(r)
@@ -712,7 +714,7 @@ func (n *mutFile) Readlink(req *fuse.ReadlinkRequest, intr fs.Intr) (string, fus
 }
 
 func (n *mutFile) Setattr(req *fuse.SetattrRequest, res *fuse.SetattrResponse, intr fs.Intr) fuse.Error {
-	log.Printf("mutFile.Setattr on %q: %#v", n.fullPath(), req)
+	Debug("mutFile.Setattr on %q: %#v", n.fullPath(), req)
 	// 2013/07/17 19:43:41 mutFile.Setattr on "foo": &fuse.SetattrRequest{Header:fuse.Header{Conn:(*fuse.Conn)(0xc210047180), ID:0x3, Node:0x3d, Uid:0xf0d4, Gid:0x1388, Pid:0x75e8}, Valid:0x30, Handle:0x0, Size:0x0, Atime:time.Time{sec:63509651021, nsec:0x4aec6b8, loc:(*time.Location)(0x47f7600)}, Mtime:time.Time{sec:63509651021, nsec:0x4aec6b8, loc:(*time.Location)(0x47f7600)}, Mode:0x4000000, Uid:0x0, Gid:0x0, Bkuptime:time.Time{sec:62135596800, nsec:0x0, loc:(*time.Location)(0x47f7600)}, Chgtime:time.Time{sec:62135596800, nsec:0x0, loc:(*time.Location)(0x47f7600)}, Crtime:time.Time{sec:0, nsec:0x0, loc:(*time.Location)(nil)}, Flags:0x0}
 
 	n.mu.Lock()
@@ -786,7 +788,7 @@ func (h *mutFileHandle) Write(req *fuse.WriteRequest, res *fuse.WriteResponse, i
 	}
 
 	n, err := h.tmp.WriteAt(req.Data, req.Offset)
-	log.Printf("mutFileHandle.Write(%q, %d bytes at %d, flags %v) = %d, %v",
+	Debug("mutFileHandle.Write(%q, %d bytes at %d, flags %v) = %d, %v",
 		h.f.fullPath(), len(req.Data), req.Offset, req.Flags, n, err)
 	if err != nil {
 		log.Println("mutFileHandle.Write:", err)
@@ -852,7 +854,7 @@ func (h *mutFileHandle) Truncate(size uint64, intr fs.Intr) fuse.Error {
 		return fuse.EIO
 	}
 
-	log.Printf("mutFileHandle.Truncate(%q) to size %d", h.f.fullPath(), size)
+	Debug("mutFileHandle.Truncate(%q) to size %d", h.f.fullPath(), size)
 	if err := h.tmp.Truncate(int64(size)); err != nil {
 		log.Println("mutFileHandle.Truncate:", err)
 		return fuse.EIO

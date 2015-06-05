@@ -181,6 +181,9 @@ func props(fs FileSystem, ls LockSystem, name string, pnames []xml.Name) ([]Prop
 	for _, pn := range pnames {
 		// If this file has dead properties, check if they contain pn.
 		if dp, ok := deadProps[pn]; ok {
+			if dp.XMLName.Space == "DAV:" {
+				dp.XMLName.Local = "D:" + dp.XMLName.Local
+			}
 			pstatOK.Props = append(pstatOK.Props, dp)
 			continue
 		}
@@ -190,13 +193,21 @@ func props(fs FileSystem, ls LockSystem, name string, pnames []xml.Name) ([]Prop
 			if err != nil {
 				return nil, err
 			}
+			local := pn.Local
+			if pn.Space == "DAV:" {
+				local = "D:" + pn.Local
+			}
 			pstatOK.Props = append(pstatOK.Props, Property{
-				XMLName:  pn,
+				XMLName:  xml.Name{Local: local, Space: pn.Space},
 				InnerXML: []byte(innerXML),
 			})
 		} else {
+			local := pn.Local
+			if pn.Space == "DAV:" {
+				local = "D:" + pn.Local
+			}
 			pstatNotFound.Props = append(pstatNotFound.Props, Property{
-				XMLName: pn,
+				XMLName: xml.Name{Local: local, Space: pn.Space},
 			})
 		}
 	}
@@ -328,7 +339,7 @@ loop:
 
 func findResourceType(fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
 	if fi.IsDir() {
-		return `<collection xmlns="DAV:"/>`, nil
+		return `<D:collection/>`, nil
 	}
 	return "", nil
 }
