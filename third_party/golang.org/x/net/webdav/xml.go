@@ -208,42 +208,28 @@ type Property struct {
 // http://www.webdav.org/specs/rfc4918.html#ELEMENT_error
 // See multistatusWriter for the "D:" namespace prefix.
 type xmlError struct {
-	XMLName  xml.Name `xml:"D:error"`
+	XMLName  xml.Name `xml:"DAV: D:error"`
 	InnerXML []byte   `xml:",innerxml"`
 }
 
 // http://www.webdav.org/specs/rfc4918.html#ELEMENT_propstat
 // See multistatusWriter for the "D:" namespace prefix.
 type propstat struct {
-	Prop                []Property `xml:"D:prop>_ignored_"`
-	Status              string     `xml:"D:status"`
-	Error               *xmlError  `xml:"D:error"`
-	ResponseDescription string     `xml:"D:responsedescription,omitempty"`
-}
-
-// MarshalXML prepends the "D:" namespace prefix on properties in the DAV: namespace
-// before encoding. See multistatusWriter.
-func (ps propstat) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	for k, prop := range ps.Prop {
-		if prop.XMLName.Space == "DAV:" {
-			prop.XMLName = xml.Name{Space: "", Local: "D:" + prop.XMLName.Local}
-			ps.Prop[k] = prop
-		}
-	}
-	// Distinct type to avoid infinite recursion of MarshalXML.
-	type newpropstat propstat
-	return e.EncodeElement(newpropstat(ps), start)
+	Prop                []Property `xml:"DAV: D:prop>_ignored_"`
+	Status              string     `xml:"DAV: D:status"`
+	Error               *xmlError  `xml:"DAV: D:error"`
+	ResponseDescription string     `xml:"DAV: D:responsedescription,omitempty"`
 }
 
 // http://www.webdav.org/specs/rfc4918.html#ELEMENT_response
 // See multistatusWriter for the "D:" namespace prefix.
 type response struct {
-	XMLName             xml.Name   `xml:"D:response"`
-	Href                []string   `xml:"D:href"`
-	Propstat            []propstat `xml:"D:propstat"`
-	Status              string     `xml:"D:status,omitempty"`
-	Error               *xmlError  `xml:"D:error"`
-	ResponseDescription string     `xml:"D:responsedescription,omitempty"`
+	XMLName             xml.Name   `xml:"DAV: D:response"`
+	Href                []string   `xml:"DAV: D:href"`
+	Propstat            []propstat `xml:"DAV: D:propstat"`
+	Status              string     `xml:"DAV: D:status,omitempty"`
+	Error               *xmlError  `xml:"DAV: D:error"`
+	ResponseDescription string     `xml:"DAV: D:responsedescription,omitempty"`
 }
 
 // MultistatusWriter marshals one or more Responses into a XML
@@ -311,12 +297,21 @@ func (w *multistatusWriter) writeHeader() error {
 	return w.enc.EncodeToken(xml.StartElement{
 		Name: xml.Name{
 			Space: "DAV:",
-			Local: "multistatus",
+			Local: "D:multistatus",
 		},
-		Attr: []xml.Attr{{
-			Name:  xml.Name{Space: "xmlns", Local: "D"},
-			Value: "DAV:",
-		}},
+		Attr: []xml.Attr{
+			{
+				Name:  xml.Name{Local: "xmlns"},
+				Value: "DAV:",
+			},
+			// http://greenbytes.de/tech/webdav/webfolder-client-list.html#issue-namespace-handling
+			// Mini-Redirector does not accept elements with a default namespace
+			// so we prefix everything with D.
+			{
+				Name:  xml.Name{Local: "xmlns:D"},
+				Value: "DAV:",
+			},
+		},
 	})
 }
 
@@ -338,7 +333,7 @@ func (w *multistatusWriter) close() error {
 		)
 	}
 	end = append(end, xml.EndElement{
-		Name: xml.Name{Space: "DAV:", Local: "multistatus"},
+		Name: xml.Name{Space: "DAV:", Local: "D:multistatus"},
 	})
 	for _, t := range end {
 		err := w.enc.EncodeToken(t)

@@ -621,6 +621,9 @@ func TestReadProppatch(t *testing.T) {
 		return "[" + strings.Join(outer, ", ") + "]"
 	}
 
+	// TODO(rost): These "golden XML" tests easily break with changes in the
+	// xml package. A whitespace-preserving normalizer of XML content is
+	// required to make these tests more robust.
 	testCases := []struct {
 		desc       string
 		input      string

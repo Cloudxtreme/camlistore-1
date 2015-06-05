@@ -19,9 +19,14 @@ limitations under the License.
 package fs
 
 import (
+	"log"
 	"testing"
 	"time"
 )
+
+func init() {
+	Debug = log.Printf
+}
 
 func TestDeleteEligibility(t *testing.T) {
 	tests := []struct {

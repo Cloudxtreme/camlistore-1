@@ -6,6 +6,7 @@
 package webdav // import "camlistore.org/third_party/golang.org/x/net/webdav"
 
 import (
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -501,7 +502,13 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 			}
 			pstat := Propstat{Status: http.StatusOK}
 			for _, xmlname := range pnames {
-				pstat.Props = append(pstat.Props, Property{XMLName: xmlname})
+				local := xmlname.Local
+				if xmlname.Space == "DAV:" {
+					local = "D:" + xmlname.Local
+				}
+				pstat.Props = append(pstat.Props, Property{
+					XMLName: xml.Name{Local: local, Space: xmlname.Space},
+				})
 			}
 			pstats = append(pstats, pstat)
 		} else if pf.Allprop != nil {
