@@ -286,13 +286,13 @@ func (fs *davFS) Stat(name string) (os.FileInfo, error) {
 
 func readdir(node fslib.Node) ([]os.FileInfo, error) {
 	debug("readdir(%s)", node)
-	nd, ok := node.(fslib.NodeDir)
+	rd, ok := node.(readdirer)
 	if !ok {
 		debug("readdir %s is not readable")
 		return nil, os.ErrInvalid
 	}
 
-	dirents, err := nd.Readdir(-1)
+	dirents, err := rd.Readdir(-1)
 	debug("ReadDir(%v): %v, %v", node, dirents, err)
 	return dirents, err
 }
@@ -353,13 +353,12 @@ func (f *davFile) readdir(count int) ([]os.FileInfo, error) {
 		return ret, f.readdirErr
 	}
 
-	if fi, err := f.Node.Stat(); err != nil {
-		return nil, err
-	} else if !fi.Mode().IsDir() {
+	rd, ok := f.Node.(readdirer)
+	if !ok {
 		return nil, os.ErrInvalid
 	}
 	f.readdirErr = nil
-	dirents, err := readdir(f.Node)
+	dirents, err := rd.Readdir(-1)
 	// On error don't fail yet, fill up & return f.dirents first.
 	if err != nil {
 		f.readdirErr = err
@@ -379,13 +378,17 @@ func (f *davFile) Read(p []byte) (int, error) {
 	}
 	f.posDirentsMu.Lock()
 	defer f.posDirentsMu.Unlock()
-	nf, ok := f.Node.(fslib.NodeFile)
+	ra, ok := f.Node.(io.ReaderAt)
 	if !ok {
-		return 0, errors.New("not readable")
+		log.Printf("%s (%T) is not readable!", f.Node, f.Node)
+		return 0, os.ErrInvalid
 	}
-	n, err := nf.ReadAt(p, f.pos)
+	n, err := ra.ReadAt(p, f.pos)
 	debug("Read %d bytes at %d", n, f.pos)
 	f.pos += int64(n)
+	if err == io.ErrUnexpectedEOF {
+		err = nil
+	}
 	return n, err
 }
 
@@ -396,12 +399,12 @@ func (f *davFile) Write(p []byte) (n int, err error) {
 	debug("Writing %d bytes on %v", len(p), f)
 	f.posDirentsMu.Lock()
 	defer f.posDirentsMu.Unlock()
-	nf, ok := f.Node.(fslib.NodeFile)
+	wa, ok := f.Node.(io.WriterAt)
 	if !ok {
 		debug("Write %s not a NodeFile", f.Node)
 		return 0, os.ErrInvalid
 	}
-	n, err = nf.WriteAt(p, f.pos)
+	n, err = wa.WriteAt(p, f.pos)
 	debug("Written %d bytes at %d", n, f.pos)
 	f.pos += int64(n)
 	return n, err
@@ -432,11 +435,24 @@ func (f *davFile) Seek(offset int64, whence int) (int64, error) {
 	return pos, nil
 }
 
+type flusher interface {
+	Flush() error
+}
+type readdirer interface {
+	Readdir(int) ([]os.FileInfo, error)
+}
+
 func (f *davFile) Close() error {
-	if cl, ok := f.Node.(io.Closer); ok {
-		return cl.Close()
+	var err error
+	if fl, ok := f.Node.(flusher); ok {
+		err = fl.Flush()
 	}
-	return nil
+	if cl, ok := f.Node.(io.Closer); ok {
+		if closeErr := cl.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
 type removeDirCloser struct {

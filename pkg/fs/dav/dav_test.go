@@ -38,6 +38,8 @@ import (
 )
 
 func TestBadRootRef(t *testing.T) {
+	t.Skip()
+
 	w := test.GetWorld(t)
 	w.Start()
 	defer w.Stop()
@@ -99,6 +101,7 @@ func TestLitmus(t *testing.T) {
 	t.Logf("docker0 ip=%s", ip)
 
 	w := test.GetWorld(t)
+	time.Sleep(1 * time.Second)
 	if err := w.Start(); err != nil {
 		t.Fatalf("cannot start World %v: %v", w, err)
 	}
@@ -116,6 +119,7 @@ func TestLitmus(t *testing.T) {
 		t.Fatalf("New(%q): %v", rootRef, err)
 	}
 	defer closer.Close()
+
 	http.Handle("/", srv)
 
 	davaddr := ":8088"
@@ -130,14 +134,18 @@ func TestLitmus(t *testing.T) {
 	select {
 	case err = <-errCh:
 		t.Fatalf("Error starting DAV server: %v", err)
-	case <-time.After(1 * time.Second): // started
+	case <-time.After(3 * time.Second): // started
 	}
+
+	SetDebug(true)
+	if err = testLitmus(t, "http://"+ip+davaddr); err != nil {
+		t.Error(err)
+	}
+	return
 
 	// sometimes only the second/third attempt goes till the end
 	for i := 0; i < 3; i++ {
-		if i == 1 {
-			SetDebug(true)
-		}
+		SetDebug(i == 1)
 		if err = testLitmus(t, "http://"+ip+davaddr); err == nil {
 			break
 		}

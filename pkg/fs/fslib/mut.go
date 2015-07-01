@@ -67,11 +67,9 @@ type mutDir struct {
 }
 
 func (m *mutDir) String() string {
-	log.Printf("m=%p", m)
 	if m == nil {
 		return "(*mutDir)(nil)"
 	}
-	log.Printf("m=%p node=%#v", m, m.node)
 	return fmt.Sprintf("&mutDir{%p name=%q perm:%v}", m, m.fullPath(), m.node.blobref)
 }
 
@@ -103,7 +101,6 @@ func (n *mutDir) fullPath() string {
 
 // populate hits the blobstore to populate map of child nodes.
 func (n *mutDir) populate() error {
-	log.Printf("%s.populate", n)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -152,11 +149,15 @@ func (n *mutDir) populate() error {
 		if target := child.Permanode.Attr.Get("camliSymlinkTarget"); target != "" {
 			// This is a symlink.
 			_, fi, _ := child.PermanodeFile()
+			var info os.FileInfo
+			if fi != nil {
+				info = fileInfoFromFI(*fi, false)
+			}
 			n.maybeAddChild(name, child.Permanode, &mutFile{
 				node: node{
 					fs:      n.node.fs,
 					blobref: blob.ParseOrZero(childRef),
-					info:    fileInfoFromFI(*fi, false),
+					info:    info,
 				},
 				parent:  n,
 				symLink: true,
@@ -165,11 +166,15 @@ func (n *mutDir) populate() error {
 		} else if isDir(child.Permanode) {
 			// This is a directory.
 			_, fi, _ := child.PermanodeDir()
+			var info os.FileInfo
+			if fi != nil {
+				info = fileInfoFromFI(*fi, true)
+			}
 			n.maybeAddChild(name, child.Permanode, &mutDir{
 				node: node{
 					fs:      n.node.fs,
 					blobref: blob.ParseOrZero(childRef),
-					info:    fileInfoFromFI(*fi, true),
+					info:    info,
 				},
 				parent: n,
 			})
@@ -188,16 +193,16 @@ func (n *mutDir) populate() error {
 				log.Printf("camlitype \"file\" child %v has no described File member", childRef)
 				continue
 			}
-			_, fi, ok := child.PermanodeFile()
-			if !ok {
-				log.Printf("camlitype \"file\" child %v has no PermanodeFile", childRef)
-				continue
+			_, fi, _ := child.PermanodeFile()
+			var info os.FileInfo
+			if fi != nil {
+				info = fileInfoFromFI(*fi, false)
 			}
 			n.maybeAddChild(name, child.Permanode, &mutFile{
 				node: node{
 					fs:      n.node.fs,
 					blobref: blob.ParseOrZero(childRef),
-					info:    fileInfoFromFI(*fi, false),
+					info:    info,
 				},
 				parent:  n,
 				content: blob.ParseOrZero(contentRef),
@@ -230,7 +235,6 @@ func (m *mutDir) maybeAddChild(name string, permanode *search.DescribedPermanode
 
 		m.children[name] = child
 	}
-	log.Printf("maybeAddChild(%s): %#v", name, m.children)
 }
 
 func isDir(d *search.DescribedPermanode) bool {
@@ -544,7 +548,6 @@ type mutFile struct {
 }
 
 func (m *mutFile) String() string {
-	log.Printf("m=%p", m)
 	if m == nil {
 		return "(*mutFile)(nil)"
 	}
@@ -586,6 +589,7 @@ func (n *mutFile) setContent(br blob.Ref, size int64) error {
 	n.size = size
 	claim := schema.NewSetAttributeClaim(n.blobref, "camliContent", br.String())
 	_, err := n.fs.client.UploadAndSignBlob(claim)
+	n.meta = nil
 	return err
 }
 
@@ -609,14 +613,14 @@ func (n *mutFile) setSizeAtLeast(size int64) {
 // fuse_filehandle_xlate_to_oflags in macosx/kext/fuse_file.h)
 func (n *mutFile) Open(flags int) (Node, error) {
 	Debug("mutFile.Open: %v: content: %v flags=%v", n.blobref, n.content, flags)
-	// Read-only.
-	if !isWriteFlags(flags) {
-		return n.node.Open(flags)
-	}
 	r, err := schema.NewFileReader(n.fs.fetcher, n.content)
 	if err != nil {
 		log.Printf("mutFile.Open: %v", err)
 		return nil, err
+	}
+	// Read-only.
+	if !isWriteFlags(flags) {
+		return nodeReader{FileReader: r, node: n.node}, nil
 	}
 	Debug("mutFile.Open returning read-write filehandle")
 
@@ -668,7 +672,6 @@ type mutFileHandle struct {
 
 func (h *mutFileHandle) Open(int) (Node, error) { return h, nil }
 func (h *mutFileHandle) String() string {
-	log.Printf("h=%p", h)
 	if h == nil {
 		return "(*mutFileHandle)(nil)"
 	}
@@ -696,7 +699,9 @@ func (h *mutFileHandle) WriteAt(p []byte, offset int64) (int, error) {
 		return 0, fmt.Errorf("Write called on camli mutFileHandle without a tempfile set")
 	}
 
-	return h.tmp.WriteAt(p, offset)
+	n, err := h.tmp.WriteAt(p, offset)
+	h.f.setSizeAtLeast(int64(n) + offset)
+	return n, err
 }
 
 // Flush is called to let the file system clean up any data buffers

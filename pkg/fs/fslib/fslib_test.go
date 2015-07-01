@@ -18,6 +18,7 @@ package fslib
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"sync"
 	"testing"
@@ -86,34 +87,46 @@ func TestFslib(t *testing.T) {
 		t.Fatalf("cannot open %s: %v", res.Name(), err)
 	}
 	content := []byte("Go is a nice concise simple language.")
-	if n, err := h.(NodeFile).WriteAt(content, 0); err != nil {
-		t.Fatalf("write %s: %v", h, err)
-	} else if n != len(content) {
-		t.Errorf("written %d, awaited %d.", n, len(content))
-	} else {
-		t.Logf("Written %d bytes to %s.", n, h)
-	}
-	if err = h.(NodeFile).Close(); err != nil {
-		t.Errorf("close of %s: %v", h, err)
-	}
+	func() {
+		defer func() {
+			if err = h.(NodeFile).Close(); err != nil {
+				t.Errorf("close of %s: %v", h, err)
+			}
+		}()
+		if n, err := h.(NodeFile).WriteAt(content, 0); err != nil {
+			t.Fatalf("write %s: %v", h, err)
+		} else if n != len(content) {
+			t.Errorf("written %d, awaited %d.", n, len(content))
+		} else {
+			t.Logf("Written %d bytes to %s.", n, h)
+		}
+	}()
 
 	if res, err = adir.(NodeDir).Lookup("res"); err != nil {
 		t.Fatalf("cannot found \"res\" in \"adir\": %v", err)
 	}
 	if h, err = res.Open(os.O_RDONLY); err != nil {
-		t.Fatalf("cannot open %s: %v", res.Name(), err)
+		t.Fatalf("cannot open %s (%s): %v", res.Name(), res, err)
 	}
-	got := make([]byte, len(content)+1)
-	if n, err := h.(NodeFile).ReadAt(got, 0); err != nil {
-		t.Fatalf("read %s: %v", h, err)
-	} else if n != len(content) {
-		t.Errorf("read %d, awaited %d bytes.", n, len(content))
-	} else if !bytes.Equal(got, content) {
-		t.Errorf("got %q, awaited %q.", got, content)
-	}
-	if err = h.(NodeFile).Close(); err != nil {
-		t.Errorf("close of %s: %v", h, err)
-	}
+	func() {
+		defer func() {
+			if err = h.(NodeFile).Close(); err != nil {
+				t.Errorf("close of %s: %v", h, err)
+			}
+		}()
+		got := make([]byte, len(content)+1)
+		if _, err := h.(NodeFile).ReadAt(got, 0); err != io.ErrUnexpectedEOF {
+			t.Errorf("over read didn't erred out! (%v)", err)
+		}
+		got = got[:len(content)]
+		if n, err := h.(NodeFile).ReadAt(got[:len(content)], 0); err != nil {
+			t.Fatalf("reading %s: %v", h, err)
+		} else if n != len(content) {
+			t.Errorf("read %d, awaited %d bytes.", n, len(content))
+		} else if !bytes.Equal(got, content) {
+			t.Errorf("got %q, awaited %q.", got, content)
+		}
+	}()
 }
 
 var ringFlagOnce sync.Once

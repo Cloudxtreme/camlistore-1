@@ -80,8 +80,6 @@ func NewRootedCamliFileSystem(cl *client.Client, fetcher blob.Fetcher, root blob
 		return nil, err
 	}
 	fs.root = n
-	log.Printf("fs=%p", fs)
-	log.Printf("fs=%#v", fs)
 
 	return fs, nil
 }
@@ -131,7 +129,6 @@ func (n node) Name() string {
 }
 func (n *node) Stat() (os.FileInfo, error) {
 	_, err := n.schema()
-	log.Printf("&node{%p}.Stat: %#v (%v)", n, n.info, err)
 	return n.info, err
 }
 func (n *node) Open(flags int) (Node, error) {
@@ -161,7 +158,6 @@ func (n *node) schema() (*schema.Blob, error) {
 	defer n.mu.Unlock()
 	if n.meta == nil {
 		blob, err := n.fs.fetchSchemaMeta(n.blobref)
-		log.Printf("&node{%p}.schema: %#v (%v)", n, blob, err)
 		if err != nil {
 			return blob, err
 		}
@@ -325,7 +321,6 @@ func (n *node) populateAttr() error {
 		info.mTime = n.pnodeModTime
 	}
 	// TODO: inode?
-	log.Printf("populateAttr(%s Type=%s): %#v (mode=%s)", n.Name(), meta.Type(), info, info.mode)
 
 	n.info = info
 	return nil
