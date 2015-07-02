@@ -154,7 +154,7 @@ func (n *mutDir) populate() error {
 				info = fileInfoFromFI(*fi, false)
 			}
 			n.maybeAddChild(name, child.Permanode, &mutFile{
-				node: node{
+				node: &node{
 					fs:      n.node.fs,
 					blobref: blob.ParseOrZero(childRef),
 					info:    info,
@@ -199,7 +199,7 @@ func (n *mutDir) populate() error {
 				info = fileInfoFromFI(*fi, false)
 			}
 			n.maybeAddChild(name, child.Permanode, &mutFile{
-				node: node{
+				node: &node{
 					fs:      n.node.fs,
 					blobref: blob.ParseOrZero(childRef),
 					info:    info,
@@ -410,7 +410,7 @@ func (n *mutDir) creat(name string, typ nodeType) (Node, error) {
 		}
 	case fileType, symlinkType:
 		child = &mutFile{
-			node: node{
+			node: &node{
 				fs:      n.node.fs,
 				blobref: pr.BlobRef,
 				info:    FileInfo{name: name, mode: 0666},
@@ -534,7 +534,7 @@ func (n *mutDir) Rename(oldname, newname string, newDir Node) error {
 
 // mutFile is a mutable file, or symlink.
 type mutFile struct {
-	node
+	*node
 	parent *mutDir
 
 	localCreateTime time.Time // time this node was created locally (iff it was)
@@ -620,7 +620,7 @@ func (n *mutFile) Open(flags int) (Node, error) {
 	}
 	// Read-only.
 	if !isWriteFlags(flags) {
-		return nodeReader{FileReader: r, node: n.node}, nil
+		return &nodeReader{FileReader: r, node: n.node}, nil
 	}
 	Debug("mutFile.Open returning read-write filehandle")
 

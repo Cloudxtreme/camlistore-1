@@ -112,22 +112,26 @@ var _ = Node((*node)(nil))
 // "directory" blob.
 type node struct {
 	fs      *CamliFileSystem
-	info    os.FileInfo
 	blobref blob.Ref
 
 	mu   sync.Mutex // guards below
 	meta *schema.Blob
+	info os.FileInfo
 
 	pnodeModTime time.Time // optionally set by recent.go; modtime of permanode
 }
 
-func (n node) Name() string {
-	if n.info == nil {
+func (n *node) Name() string {
+	n.mu.Lock()
+	info := n.info
+	n.mu.Unlock()
+	if info == nil {
 		return ""
 	}
-	return n.info.Name()
+	return info.Name()
 }
 func (n *node) Stat() (os.FileInfo, error) {
+	Debug("CAMLI Stat(%v)", n.Name())
 	_, err := n.schema()
 	return n.info, err
 }
@@ -150,7 +154,7 @@ func (n *node) Open(flags int) (Node, error) {
 		log.Printf("NewFileReader(%s) = %v", n.blobref, err)
 		return nil, err
 	}
-	return nodeReader{FileReader: fr, node: *n}, nil
+	return &nodeReader{FileReader: fr, node: n}, nil
 }
 func (n *node) schema() (*schema.Blob, error) {
 	// TODO: use singleflight library here instead of a lock?
@@ -181,10 +185,11 @@ type nodeDir struct {
 	lookMap map[string]blob.Ref
 }
 
+func (n *nodeDir) Stat() (os.FileInfo, error) { return n.node.Stat() }
+
 func (n nodeDir) Create(string, int, os.FileMode) (Node, error) { return nil, os.ErrInvalid }
 func (n nodeDir) Mkdir(string, os.FileMode) (Node, error)       { return nil, os.ErrInvalid }
-func (n nodeDir) Stat() (os.FileInfo, error)                    { return n.node.Stat() }
-func (n nodeDir) Open(int) (Node, error)                        { return n, nil }
+func (n *nodeDir) Open(int) (Node, error)                       { return n, nil }
 func (n nodeDir) Remove(string) error                           { return os.ErrPermission }
 func (n nodeDir) Rename(string, string, Node) error             { return os.ErrPermission }
 
@@ -218,7 +223,7 @@ func (n *nodeDir) Lookup(name string) (Node, error) {
 	defer n.mu.Unlock()
 	ref, ok := n.lookMap[name]
 	if !ok {
-		log.Printf("no %q in %s (%v)", name, n, n.lookMap)
+		log.Printf("no %q in %v (%v)", name, n, n.lookMap)
 		return nil, os.ErrNotExist
 	}
 	return &node{fs: n.fs, blobref: ref}, nil
@@ -267,12 +272,12 @@ var _ = NodeFile((*nodeReader)(nil))
 
 type nodeReader struct {
 	*schema.FileReader
-	node
+	*node
 }
 
 func (nodeReader) WriteAt([]byte, int64) (int, error) { return 0, os.ErrInvalid }
-func (nr nodeReader) Open(flags int) (Node, error)    { return nr.node.Open(flags) }
-func (nr nodeReader) Stat() (os.FileInfo, error)      { return nr.node.Stat() }
+func (nr *nodeReader) Open(flags int) (Node, error)   { return nr.node.Open(flags) }
+func (nr *nodeReader) Stat() (os.FileInfo, error)     { return nr.node.Stat() }
 
 var _ = os.FileInfo(FileInfo{})
 

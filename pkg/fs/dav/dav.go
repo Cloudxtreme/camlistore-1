@@ -211,8 +211,9 @@ func (fs *davFS) RemoveAll(name string) error {
 	if err != nil || node == nil {
 		return nil
 	}
-	if _, isdir := node.(fslib.NodeDir); isdir {
-		dirents, err := readdir(node)
+	rd, ok := node.(readdirer)
+	if ok {
+		dirents, err := rd.Readdir(-1)
 		if err != nil {
 			return err
 		}
@@ -284,19 +285,6 @@ func (fs *davFS) Stat(name string) (os.FileInfo, error) {
 	return node.Stat()
 }
 
-func readdir(node fslib.Node) ([]os.FileInfo, error) {
-	debug("readdir(%s)", node)
-	rd, ok := node.(readdirer)
-	if !ok {
-		debug("readdir %s is not readable")
-		return nil, os.ErrInvalid
-	}
-
-	dirents, err := rd.Readdir(-1)
-	debug("ReadDir(%v): %v, %v", node, dirents, err)
-	return dirents, err
-}
-
 func (fs *davFS) nodeForPath(p string) (fslib.Node, error) {
 	node := fs.Node
 	parts := strings.Split(strings.TrimPrefix(path.Clean(p), "/"), "/")
@@ -305,12 +293,12 @@ func (fs *davFS) nodeForPath(p string) (fslib.Node, error) {
 		if part == "" || part == "." {
 			continue
 		}
-		nd, ok := node.(fslib.NodeDir)
+		lk, ok := node.(lookuper)
 		if !ok {
 			debug("%s is not a NodeDir", node)
 			return nil, os.ErrNotExist
 		}
-		if node, err = nd.Lookup(part); err != nil {
+		if node, err = lk.Lookup(part); err != nil {
 			return nil, err
 		}
 	}
@@ -358,16 +346,12 @@ func (f *davFile) readdir(count int) ([]os.FileInfo, error) {
 		return nil, os.ErrInvalid
 	}
 	f.readdirErr = nil
-	dirents, err := rd.Readdir(-1)
+	f.dirents, f.readdirErr = rd.Readdir(-1)
 	// On error don't fail yet, fill up & return f.dirents first.
-	if err != nil {
-		f.readdirErr = err
-	}
-	if len(dirents) == 0 {
-		return f.dirents[:0], err
+	if len(f.dirents) == 0 {
+		return f.dirents[:0], f.readdirErr
 	}
 
-	f.dirents = append(f.dirents, dirents...)
 	return f.readdir(count)
 }
 
@@ -376,16 +360,16 @@ func (f *davFile) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	f.posDirentsMu.Lock()
-	defer f.posDirentsMu.Unlock()
 	ra, ok := f.Node.(io.ReaderAt)
 	if !ok {
 		log.Printf("%s (%T) is not readable!", f.Node, f.Node)
 		return 0, os.ErrInvalid
 	}
+	f.posDirentsMu.Lock()
 	n, err := ra.ReadAt(p, f.pos)
 	debug("Read %d bytes at %d", n, f.pos)
 	f.pos += int64(n)
+	f.posDirentsMu.Unlock()
 	if err == io.ErrUnexpectedEOF {
 		err = nil
 	}
@@ -397,16 +381,16 @@ func (f *davFile) Write(p []byte) (n int, err error) {
 		return 0, nil
 	}
 	debug("Writing %d bytes on %v", len(p), f)
-	f.posDirentsMu.Lock()
-	defer f.posDirentsMu.Unlock()
 	wa, ok := f.Node.(io.WriterAt)
 	if !ok {
 		debug("Write %s not a NodeFile", f.Node)
 		return 0, os.ErrInvalid
 	}
+	f.posDirentsMu.Lock()
 	n, err = wa.WriteAt(p, f.pos)
 	debug("Written %d bytes at %d", n, f.pos)
 	f.pos += int64(n)
+	f.posDirentsMu.Unlock()
 	return n, err
 }
 
@@ -441,8 +425,12 @@ type flusher interface {
 type readdirer interface {
 	Readdir(int) ([]os.FileInfo, error)
 }
+type lookuper interface {
+	Lookup(string) (fslib.Node, error)
+}
 
 func (f *davFile) Close() error {
+	debug("Close %v", f)
 	var err error
 	if fl, ok := f.Node.(flusher); ok {
 		err = fl.Flush()

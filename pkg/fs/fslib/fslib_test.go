@@ -55,7 +55,7 @@ func TestFslib(t *testing.T) {
 	if err != nil {
 		t.Fatalf("root.Stat: %v", err)
 	}
-	t.Logf("root=%p (%T) fi=%#v", root, root, fi)
+	t.Logf("root=%v (%T) fi=%#v", root, root, fi)
 	t.Logf("mode=%v", fi.Mode())
 	if !fi.Mode().IsDir() {
 		t.Fatalf("root should be a writable permanode, %s is read-only", root)
