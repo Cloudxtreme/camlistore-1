@@ -45,6 +45,8 @@ import (
 	"camlistore.org/third_party/code.google.com/p/xsrftoken"
 )
 
+var ErrBackoff = errors.New("backoff")
+
 const (
 	maxRecentErrors   = 20
 	queueSyncInterval = 5 * time.Second
@@ -398,8 +400,9 @@ func (sh *SyncHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		f("<h2>Recent Errors</h2><p>Blobs that haven't successfully copied over yet, and their last errors:</p><ul>")
 		for _, br := range recentErrors {
 			fail := sh.lastFail[br]
-			f("<li>%s: %s: %s</li>\n",
+			f("<li>%s [%d]: %s: %s</li>\n",
 				br,
+				fail.count,
 				fail.when.Format(time.RFC3339),
 				html.EscapeString(fail.err.Error()))
 		}
@@ -549,6 +552,12 @@ func (sh *SyncHandler) copyWorker(res chan<- copyResult, work <-chan blob.SizedR
 
 func (sh *SyncHandler) copyBlob(sb blob.SizedRef) (err error) {
 	cs := sh.newCopyStatus(sb)
+	if details, ok := sh.lastFail[sb.Ref]; ok &&
+		cs.t.Sub(details.when) < time.Duration((1<<uint(details.count)))*time.Second {
+		err = ErrBackoff
+		cs.setError(err)
+		return
+	}
 	defer func() { cs.setError(err) }()
 	br := sb.Ref
 
@@ -888,9 +897,20 @@ func (cs *copyStatus) setError(err error) {
 
 	sh.totalErrors++
 	sh.logf("error copying %v: %v", br, err)
-	sh.lastFail[br] = failDetail{
-		when: now,
-		err:  err,
+	if detail, ok := sh.lastFail[br]; ok {
+		if err == detail.err {
+			detail.count++
+			detail.when = now
+		} else {
+			detail.when, detail.err, detail.count = now, err, 1
+		}
+		sh.lastFail[br] = detail
+	} else {
+		sh.lastFail[br] = failDetail{
+			when:  now,
+			err:   err,
+			count: 1,
+		}
 	}
 
 	// Kinda lame. TODO: use a ring buffer or container/list instead.
@@ -934,8 +954,9 @@ func (cs *copyStatus) String() string {
 }
 
 type failDetail struct {
-	when time.Time
-	err  error
+	when  time.Time
+	err   error
+	count int
 }
 
 // incrWriter is an io.Writer that locks mu and increments *n.
