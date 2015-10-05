@@ -30,6 +30,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/importer"
@@ -61,6 +63,13 @@ const (
 
 	// attrPicasaId is used for both picasa photo IDs and gallery IDs.
 	attrPicasaId = "picasaId"
+
+	// albumTimeout is the duration for retrying the import for one album.
+	albumTimeout = time.Minute
+	// maxContErrors is the number of maximum allowed consecutive errors for album imports.
+	maxContErrors = 10
+	// retryQueueLen is the maximum number of albums waiting for retry their import.
+	retryQueueLen = 50
 )
 
 var _ importer.ImporterSetupHTMLer = imp{}
@@ -141,6 +150,10 @@ type run struct {
 
 	mu     sync.Mutex // guards anyErr
 	anyErr bool
+
+	contErrors uint32         // number of consecutive errors when retrying to import albums
+	retryCh    chan retryArgs // channel for album import retry parameters
+	startRetry sync.Once      // start the retry goroutine only once
 }
 
 func (r *run) errorf(format string, args ...interface{}) {
@@ -205,20 +218,113 @@ func (r *run) importAlbums() error {
 		return fmt.Errorf("importAlbums: error listing albums: %v", err)
 	}
 	albumsNode, err := r.getTopLevelNode("albums", "Albums")
+	if err != nil {
+		return fmt.Errorf("importAlbums: find top level \"albums\" node: %v", err)
+	}
+	errc := make(chan error, 1)
+	var wg sync.WaitGroup
+	var retryErr error
+	ctx := context.Context(r)
 	for _, album := range albums {
 		select {
 		case <-r.Done():
 			return r.Err()
 		default:
 		}
-		if err := r.importAlbum(albumsNode, album); err != nil {
-			return fmt.Errorf("picasa importer: error importing album %s: %v", album, err)
+		if err := r.importAlbum(ctx, albumsNode, album); err != nil {
+			log.Printf("Importing %q failed, will try again.", album.Name)
+			r.startRetry.Do(func() {
+				r.retryCh = make(chan retryArgs, retryQueueLen)
+				go func() {
+					defer close(errc)
+					retryErr = r.retryAlbums()
+					errc <- retryErr // hopefully nil
+				}()
+			})
+			atomic.AddUint32(&r.contErrors, 1)
+
+			wg.Add(1)
+			go func(reArg retryArgs) {
+				defer wg.Done()
+				select {
+				case r.retryCh <- reArg:
+				case <-errc:
+				case <-r.Done(): // retryAlbums will return r.Err()
+				}
+			}(retryArgs{Node: albumsNode, Album: album})
 		}
 	}
-	return nil
+	if r.retryCh == nil {
+		return nil
+	}
+	wg.Wait() // Just so we don't leak all the goroutines sending on retryCh
+	//<-errc // FIXME(tgulacsi): this blocks
+	close(r.retryCh) // We should not close retryCh sooner, because we have to wait for retryAlbums to be finished first.
+	return retryErr
 }
 
-func (r *run) importAlbum(albumsNode *importer.Object, album picago.Album) (ret error) {
+type retryArgs struct {
+	Node  *importer.Object
+	Album picago.Album
+}
+
+// retryAlbums retries importing each album received on r.retryCh, until it
+// either succeeds or reaches albumTimeout. It returns an error as soon as
+// r.contErrors consecutive failures are reached.
+//
+// When r.retryCh is closed by the caller, it returns an error
+// if any of the retries did not eventually succeed.
+func (r *run) retryAlbums() error {
+	var stickyErr error
+
+	for args := range r.retryCh {
+		albumDeadline := time.Now().Add(albumTimeout)
+		backoff := time.Second
+		retryNo := 0
+		var lastErr error
+		for {
+			if time.Now().After(albumDeadline) {
+				lastErr = context.DeadlineExceeded
+				break // try the next album
+			}
+			select {
+			case <-r.Done():
+				return r.Err()
+			default:
+			}
+			retryNo++
+			log.Printf("Trying %q, again (%d.).", args.Album.Name, retryNo)
+			ctx, cancel := context.WithDeadline(r, albumDeadline)
+			lastErr = r.importAlbum(ctx, args.Node, args.Album)
+			cancel()
+			if lastErr == nil {
+				log.Printf("Importing %q succeeded!", args.Album.Name)
+				break
+			}
+			log.Printf("Importing %q failed (%v), sleeping for %s.", args.Album.Name, lastErr, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-r.Done():
+				return r.Err()
+			}
+			backoff += backoff / 2
+		}
+		if lastErr == nil {
+			atomic.SwapUint32(&r.contErrors, 0)
+			continue
+		}
+		if stickyErr == nil {
+			stickyErr = lastErr
+		}
+		contErrors := atomic.AddUint32(&r.contErrors, 1)
+		if contErrors > uint32(maxContErrors) {
+			return fmt.Errorf("importAlbums: giving up after %d consecutive errors. Last error: %v", contErrors, lastErr)
+		}
+	}
+	return stickyErr
+}
+
+func (r *run) importAlbum(ctx context.Context, albumsNode *importer.Object, album picago.Album) (ret error) {
 	if album.ID == "" {
 		return errors.New("album has no ID")
 	}
@@ -254,13 +360,18 @@ func (r *run) importAlbum(albumsNode *importer.Object, album picago.Album) (ret 
 		}
 	}()
 
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 	log.Printf("Importing album %v: %v/%v (published %v, updated %v)", album.ID, album.Name, album.Title, album.Published, album.Updated)
 
 	// TODO(bradfitz): GetPhotos does multiple HTTP requests to
 	// return a slice of all photos. My "InstantUpload/Auto
 	// Backup" album has 6678 photos (and growing) and this
 	// currently takes like 40 seconds. Fix.
-	photos, err := picago.GetPhotos(ctxutil.Client(r), "default", album.ID)
+	photos, err := picago.GetPhotos(ctxutil.Client(ctx), "default", album.ID)
 	if err != nil {
 		return err
 	}
@@ -271,8 +382,8 @@ func (r *run) importAlbum(albumsNode *importer.Object, album picago.Album) (ret 
 	var grp syncutil.Group
 	for i := range photos {
 		select {
-		case <-r.Done():
-			return r.Err()
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
 		}
 		photo := photos[i]
@@ -397,7 +508,12 @@ func (r *run) updatePhotoInAlbum(albumNode *importer.Object, photo picago.Photo)
 	return nil
 }
 
+var testTopLevelNode *importer.Object
+
 func (r *run) getTopLevelNode(path string, title string) (*importer.Object, error) {
+	if testTopLevelNode != nil {
+		return testTopLevelNode, nil
+	}
 	childObject, err := r.RootNode().ChildPathObject(path)
 	if err != nil {
 		return nil, err
