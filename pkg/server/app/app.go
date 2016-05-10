@@ -166,6 +166,9 @@ func NewHandler(conf jsonconfig.Obj, apiHost, appHandlerPrefix string) (*Handler
 	if err != nil {
 		return nil, fmt.Errorf("could not parse backendURL %q: %v", backendURL, err)
 	}
+	if proxyURL.Scheme == "https" {
+		proxyURL.Scheme = "http"
+	}
 	return &Handler{
 		name:       name,
 		envVars:    envVars,
